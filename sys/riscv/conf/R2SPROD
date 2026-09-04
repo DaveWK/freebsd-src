@@ -1,0 +1,12 @@
+include R2S
+ident		R2SPROD
+
+nooptions	WITNESS
+nooptions	WITNESS_SKIPSPIN
+nooptions	INVARIANTS
+nooptions	INVARIANT_SUPPORT
+nooptions	DEADLKRES
+nooptions	QUEUE_MACRO_DEBUG_TRASH
+nooptions	BUF_TRACKING
+nooptions	FULL_BUF_TRACKING
+nooptions	DIAGNOSTIC
