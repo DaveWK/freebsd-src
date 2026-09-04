@@ -99,6 +99,8 @@ struct bus_dmamap {
 	u_int			flags;
 #define	DMAMAP_COULD_BOUNCE	(1 << 0)
 #define	DMAMAP_FROM_DMAMEM	(1 << 1)
+#define	DMAMAP_MBUF		(1 << 2)
+#define	DMAMAP_COHERENT		(1 << 3)
 	int			sync_count;
 	struct sync_list	slist[];
 };
@@ -157,6 +159,14 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 		/* Copy some flags from the parent */
 		newtag->bounce_flags |= parent->bounce_flags & BF_COHERENT;
 	}
+
+	/*
+	 * Non-coherent RISC-V DMA (e.g. SpacemiT K1): unaligned streaming
+	 * buffers must be bounced (cacheline_bounce()); enable bouncing on
+	 * every non-coherent tag so bounce pages are available for them.
+	 */
+	if ((newtag->bounce_flags & BF_COHERENT) == 0)
+		newtag->bounce_flags |= BF_COULD_BOUNCE;
 
 	if (newtag->common.lowaddr < ptoa((vm_paddr_t)Maxmem) ||
 	    newtag->common.alignment > 1)
@@ -483,6 +493,39 @@ bounce_bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
 	    dmat->bounce_flags);
 }
 
+/*
+ * Return true if a non-coherent streaming buffer is not aligned to a cache
+ * line on both ends and therefore must be bounced.  dma_dcache_sync()'s
+ * POSTREAD path invalidates at cache-line granularity; a partial edge line
+ * shared with a neighbouring allocation would have that allocation's dirty
+ * data discarded -> heap corruption.  Ported from the arm64 bus_dma code
+ * that the RISC-V implementation was derived from but which omitted it.
+ * bus_dmamem_alloc'd, coherent and mbuf buffers are exempt.
+ */
+static bool
+cacheline_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
+    bus_size_t size)
+{
+	if ((dmat->bounce_flags & BF_COHERENT) != 0)
+		return (false);
+	if (map != NULL && (map->flags &
+	    (DMAMAP_FROM_DMAMEM | DMAMAP_COHERENT | DMAMAP_MBUF)) != 0)
+		return (false);
+	return (((paddr | size) & (dcache_line_size - 1)) != 0);
+}
+
+static bool
+must_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
+    bus_size_t size)
+{
+	if (cacheline_bounce(dmat, map, paddr, size))
+		return (true);
+	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0 &&
+	    addr_needs_bounce(dmat, paddr))
+		return (true);
+	return (false);
+}
+
 static void
 _bus_dmamap_count_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
     bus_size_t buflen, int flags)
@@ -498,7 +541,7 @@ _bus_dmamap_count_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
 		curaddr = buf;
 		while (buflen != 0) {
 			sgsize = buflen;
-			if (addr_needs_bounce(dmat, curaddr)) {
+			if (must_bounce(dmat, map, curaddr, sgsize)) {
 				sgsize = MIN(sgsize,
 				    PAGE_SIZE - (curaddr & PAGE_MASK));
 				map->pagesneeded++;
@@ -540,7 +583,7 @@ _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
 				paddr = pmap_kextract(vaddr);
 			else
 				paddr = pmap_extract(pmap, vaddr);
-			if (addr_needs_bounce(dmat, paddr)) {
+			if (must_bounce(dmat, map, paddr, sg_len)) {
 				sg_len = roundup2(sg_len,
 				    dmat->common.alignment);
 				map->pagesneeded++;
@@ -583,9 +626,8 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	while (buflen > 0) {
 		curaddr = buf;
 		sgsize = buflen;
-		if (((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) &&
-		    map->pagesneeded != 0 &&
-		    addr_needs_bounce(dmat, curaddr)) {
+		if (map->pagesneeded != 0 &&
+		    must_bounce(dmat, map, curaddr, sgsize)) {
 			sgsize = MIN(sgsize, PAGE_SIZE - (curaddr & PAGE_MASK));
 			curaddr = add_bounce_page(dmat, map, 0, curaddr,
 			    sgsize);
@@ -635,6 +677,9 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 	char *kvaddr, *vaddr, *sl_vend;
 	int error;
 
+	if ((flags & BUS_DMA_LOAD_MBUF) != 0)
+		map->flags |= DMAMAP_MBUF;
+
 	if (segs == NULL)
 		segs = dmat->segments;
 
@@ -668,9 +713,8 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 		 * Compute the segment size, and adjust counts.
 		 */
 		sgsize = MIN(buflen, PAGE_SIZE - (curaddr & PAGE_MASK));
-		if (((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) &&
-		    map->pagesneeded != 0 &&
-		    addr_needs_bounce(dmat, curaddr)) {
+		if (map->pagesneeded != 0 &&
+		    must_bounce(dmat, map, curaddr, sgsize)) {
 			sgsize = roundup2(sgsize, dmat->common.alignment);
 			sgsize = MIN(sgsize, buflen);
 			curaddr = add_bounce_page(dmat, map, kvaddr, curaddr,
@@ -747,6 +791,7 @@ bounce_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 {
 	free_bounce_pages(dmat, map);
 	map->sync_count = 0;
+	map->flags &= ~DMAMAP_MBUF;
 }
 
 static void
