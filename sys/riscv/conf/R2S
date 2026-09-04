@@ -1,0 +1,40 @@
+include GENERIC
+ident		R2S
+
+options		EARLY_PRINTF=sbi
+nodevice	vt_efifb
+nodevice	uart_ns8250
+
+# Use the hardware-validated fork clock provider until the upstream K1 clock
+# framework covers the APBC and the complete APMU clock/reset set.
+nodevice	k1_ccu
+device		spacemit_ccu
+
+device		smte
+device		miibus
+device		spacemit_reset
+device		gpio
+device		spacemit_gpio
+device		spacemit_pinctrl
+device		dwc3
+device		spacemit_usb2phy
+device		spacemit_combphy
+device		spacemit_tsensor
+device		spacemit_rtc
+device		spacemit_crng
+device		iicbus
+device		iic
+device		spacemit_i2c
+device		regulator
+device		spacemit_p1
+device		spacemit_pcie_phy
+device		pwmbus
+device		pwm
+device		spacemit_pwm
+device		spibus
+device		spigen
+device		spacemit_spi
+device		spacemit_pcie
+device		spacemit_ehci
+device		spacemit_qspi
+device		rge
