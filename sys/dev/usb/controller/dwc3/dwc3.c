@@ -65,6 +65,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <dev/clk/clk.h>
+#include <dev/regulator/regulator.h>
 #include <dev/phy/phy_usb.h>
 #endif
 
@@ -109,12 +110,60 @@ xhci_interrupt_poll(void *_sc)
 	usb_callout_reset(&sc->sc_callout, 1, (void *)&xhci_interrupt_poll, sc);
 }
 
+/*
+ * Undo whatever snps_dwc3_attach_xhci() got as far as setting up.
+ *
+ * Ordering follows xhci_pci_detach(): children first, then the callout, then
+ * halt the controller so it is not still doing DMA when xhci_uninit() frees
+ * the pages underneath it, then the interrupt and its resource.  Every step is
+ * guarded, so this is safe to call from any point in attach.
+ *
+ * "inited" says whether xhci_init() succeeded; before that there is no
+ * bus_mtx, no callout and no DMA memory, and calling xhci_uninit() would
+ * destroy an uninitialised sx/cv.
+ */
+static void
+snps_dwc3_unwind_xhci(device_t dev, bool inited)
+{
+	struct snps_dwc3_softc *snps_sc = device_get_softc(dev);
+	struct xhci_softc *sc = &snps_sc->sc;
+
+	device_delete_children(dev);
+	sc->sc_bus.bdev = NULL;
+
+	if (inited) {
+		usb_callout_drain(&sc->sc_callout);
+		(void)xhci_halt_controller(sc);
+		xhci_uninit(sc);
+	}
+
+	if (sc->sc_intr_hdl != NULL) {
+		(void)bus_teardown_intr(dev, sc->sc_irq_res, sc->sc_intr_hdl);
+		sc->sc_intr_hdl = NULL;
+	}
+	if (sc->sc_irq_res != NULL) {
+		bus_release_resource(dev, SYS_RES_IRQ,
+		    rman_get_rid(sc->sc_irq_res), sc->sc_irq_res);
+		sc->sc_irq_res = NULL;
+	}
+
+	/*
+	 * sc_io_res is an alias of snps_sc->mem_res, which the caller releases.
+	 * Drop the alias rather than the resource: releasing it here would be a
+	 * double free, and leaving it set hands a later detach a dangling
+	 * pointer to the same window.
+	 */
+	sc->sc_io_res = NULL;
+	sc->sc_io_size = 0;
+}
+
 static int
 snps_dwc3_attach_xhci(device_t dev)
 {
 	struct snps_dwc3_softc *snps_sc = device_get_softc(dev);
 	struct xhci_softc *sc = &snps_sc->sc;
 	int err = 0, rid = 0;
+	bool inited = false;
 
 	sc->sc_io_res = snps_sc->mem_res;
 	sc->sc_io_tag = snps_sc->bst;
@@ -125,13 +174,15 @@ snps_dwc3_attach_xhci(device_t dev)
 	    RF_SHAREABLE | RF_ACTIVE);
 	if (sc->sc_irq_res == NULL) {
 		device_printf(dev, "Failed to allocate IRQ\n");
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	sc->sc_bus.bdev = device_add_child(dev, "usbus", DEVICE_UNIT_ANY);
 	if (sc->sc_bus.bdev == NULL) {
 		device_printf(dev, "Failed to add USB device\n");
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	device_set_ivars(sc->sc_bus.bdev, &sc->sc_bus);
@@ -145,15 +196,17 @@ snps_dwc3_attach_xhci(device_t dev)
 		if (err != 0) {
 			device_printf(dev, "Failed to setup IRQ, %d\n", err);
 			sc->sc_intr_hdl = NULL;
-			return (err);
+			goto fail;
 		}
 	}
 
 	err = xhci_init(sc, dev, IS_DMA_32B);
 	if (err != 0) {
 		device_printf(dev, "Failed to init XHCI, with error %d\n", err);
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
+	inited = true;
 
 	usb_callout_init_mtx(&sc->sc_callout, &sc->sc_bus.bus_mtx, 0);
 
@@ -167,17 +220,23 @@ snps_dwc3_attach_xhci(device_t dev)
 	err = xhci_start_controller(sc);
 	if (err != 0) {
 		device_printf(dev, "Failed to start XHCI controller, with error %d\n", err);
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	device_printf(sc->sc_bus.bdev, "trying to attach\n");
 	err = device_probe_and_attach(sc->sc_bus.bdev);
 	if (err != 0) {
 		device_printf(dev, "Failed to initialize USB, with error %d\n", err);
-		return (ENXIO);
+		err = ENXIO;
+		goto fail;
 	}
 
 	return (0);
+
+fail:
+	snps_dwc3_unwind_xhci(dev, inited);
+	return (err);
 }
 
 #ifdef DWC3_DEBUG
@@ -305,9 +364,15 @@ snps_dwc3_configure_phy(struct snps_dwc3_softc *sc, phandle_t node)
 		reg |= DWC3_GUSB2PHYCFG0_PHYIF |
 			DWC3_GUSB2PHYCFG0_USBTRDTIM(DWC3_GUSB2PHYCFG0_USBTRDTIM_16BITS);
 	} else {
+		/*
+		 * 8-bit UTMI+: PHYIF must be CLEARED. Setting it here (as the
+		 * utmi_wide branch does) tells the core it has a 16-bit PHY
+		 * while USBTRDTIM still carries the 8-bit turnaround value.
+		 * This mismatch is incorrect independently of the K1 reset issue;
+		 * clearing PHYIF alone did not make USBCMD.HCRST self-clear.
+		 */
 		reg &= ~(DWC3_GUSB2PHYCFG0_PHYIF | DWC3_GUSB2PHYCFG0_USBTRDTIM(0xf));
-		reg |= DWC3_GUSB2PHYCFG0_PHYIF |
-			DWC3_GUSB2PHYCFG0_USBTRDTIM(DWC3_GUSB2PHYCFG0_USBTRDTIM_8BITS);
+		reg |= DWC3_GUSB2PHYCFG0_USBTRDTIM(DWC3_GUSB2PHYCFG0_USBTRDTIM_8BITS);
 	}
 	DWC3_WRITE(sc, DWC3_GUSB2PHYCFG0, reg);
 	OF_prop_free(phy_type);
@@ -468,6 +533,19 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 			device_printf(dev, "Cannot enable bus_clk\n");
 	}
 
+	/* Enable an optional board VBUS supply before starting either PHY. */
+	{
+		regulator_t vbus;
+
+		if (regulator_get_by_ofw_property(dev, node, "vbus-supply",
+		    &vbus) == 0 && vbus != NULL) {
+			if (regulator_enable(vbus) != 0)
+				device_printf(dev, "cannot enable vbus-supply\n");
+			else if (bootverbose)
+				device_printf(dev, "vbus-supply enabled\n");
+		}
+	}
+
 	/* Get the phys */
 	usb2_phy = usb3_phy = NULL;
 	error = phy_get_by_ofw_name(dev, node, "usb2-phy", &usb2_phy);
@@ -516,6 +594,21 @@ skip_phys:
 			clk_disable(sc->clk_bus);
 	}
 #endif
+	/*
+	 * Give the register window back if we are failing.  Newbus does not do
+	 * this for us, and the reservation outlives the device that owned it:
+	 * the child's resource list keeps the FDT-derived entry with res ==
+	 * NULL while the range stays busy in the rman ("devinfo -ru" shows it
+	 * owned by "unknown").  Nothing then points at the orphan, so a later
+	 * device_probe_and_attach() -- which newbus does automatically whenever
+	 * a new driver registers on the same bus -- cannot re-acquire it and
+	 * fails early with "Failed to map memory", making the real failure
+	 * impossible to retry without a reboot.
+	 */
+	if (error != 0 && sc->mem_res != NULL) {
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mem_res);
+		sc->mem_res = NULL;
+	}
 	return (error);
 }
 
