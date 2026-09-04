@@ -63,6 +63,10 @@
 		i2c2-0-pins {
 			pinmux = <K1_PADCONF(84, 4)>,	/* I2C2_SCL */
 				 <K1_PADCONF(85, 4)>;	/* I2C2_SDA */
+			bias-pull-up = <0>;
+			drive-strength = <32>;
+			power-source = <1800>;
+			spacemit,apply-pinconf;
 		};
 	};
 
@@ -70,6 +74,10 @@
 		i2c8-0-pins {
 			pinmux = <K1_PADCONF(93, 0)>,	/* PWR_SCL */
 				 <K1_PADCONF(94, 0)>;	/* PWR_SDA */
+			bias-pull-up = <0>;
+			drive-strength = <32>;
+			power-source = <1800>;
+			spacemit,apply-pinconf;
 		};
 	};
 
