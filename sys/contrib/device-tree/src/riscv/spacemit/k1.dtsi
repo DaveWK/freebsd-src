@@ -1196,6 +1196,7 @@
 				snps,dis_u2_susphy_quirk;
 				snps,dis_u3_susphy_quirk;
 				snps,dis_rxdet_inp3_quirk;
+				snps,dis-tx-ipgap-linecheck-quirk;
 				status = "disabled";
 			};
 

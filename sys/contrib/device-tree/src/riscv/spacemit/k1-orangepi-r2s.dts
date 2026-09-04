@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: (GPL-2.0 OR MIT)
 /*
+ * Copyright (C) 2024 Yangyu Chen <cyy@cyyself.name>
+ * Copyright (C) 2025 Hendrik Hamerlinck <hendrik.hamerlinck@hammernet.be>
  * Copyright (C) 2025 Michael Opdenacker <michael.opdenacker@rootcommit.com>
+ *
+ * Orange Pi R2S (2 GB) variant, derived from the RV2 board DTS.
+ * Deltas vs RV2 (verified against the vendor Linux k1-orangepi-r2s.dtb):
+ *   - no on-board WiFi  -> wifi_pwrseq + &sdhci1 (SDIO) removed
+ *   - 2x GbE emac (eth0/eth1) IDENTICAL to RV2 (same PHY reset GPIOs 110/115,
+ *     spacemit,k1-emac, rgmii-id) -> works with the smte(4) driver as-is
+ *   - 2x RTL8125 2.5GbE hang off &pcie1 / &pcie2 (unchanged here); driven by the
+ *     in-base rge(4) driver (add "device rge") -- base re(4) has no RTL8125
+ *     support.
  */
 
 /dts-v1/;
@@ -16,26 +27,93 @@
 		serial0 = &uart0;
 		ethernet0 = &eth0;
 		ethernet1 = &eth1;
+		mmc0 = &emmc;
 	};
 
 	chosen {
 		stdout-path = "serial0";
 	};
+
+	pcie_vcc3v3: regulator-pcie-vcc3v3 {
+		compatible = "regulator-fixed";
+		enable-active-high;
+		gpios = <&gpio K1_GPIO(116) GPIO_ACTIVE_HIGH>;
+		regulator-name = "pcie_vcc3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc_5v0>;
+	};
+
+	vcc_5v0: regulator-vcc-5v0 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_5v0";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+	};
+
+	vcc4v0: regulator-vcc4v0 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc4v0";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <4000000>;
+		regulator-max-microvolt = <4000000>;
+		vin-supply = <&vcc_5v0>;
+	};
+
+	/*
+	 * VBUS for the USB 3 host port is GPIO 126, not 123.  GPIO 123 is the
+	 * RV2's pin (and on the R2S the vendor uses it for its second USB2
+	 * port), and with 123 driven instead the port stays powered-but-empty:
+	 * PORTSC reads 0x2a0 (PP=1, CCS=0) no matter what is plugged in.
+	 * Measured: driving 126 high makes the same port come up as
+	 * PORTSC 0x1203 (CCS=1, PED=1, SuperSpeed) and the device enumerates;
+	 * driving 123 low afterwards changes nothing.  Matches mainline Linux
+	 * arch/riscv/boot/dts/spacemit/k1-orangepi-r2s.dts.
+	 */
+	vcc5v0_usb: regulator-vcc5v0-usb {
+		compatible = "regulator-fixed";
+		enable-active-high;
+		gpios = <&gpio K1_GPIO(126) GPIO_ACTIVE_HIGH>;
+		regulator-name = "vcc5v0_usb";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led1 {
+			label = "sys-led";
+			gpios = <&gpio K1_GPIO(96) GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "heartbeat";
+			default-state = "on";
+		};
+	};
+
+};
+
+&combo_phy {
+	status = "okay";
 };
 
 &emmc {
 	bus-width = <8>;
 	mmc-hs400-1_8v;
 	mmc-hs400-enhanced-strobe;
-	non-removable;
 	no-sd;
 	no-sdio;
+	non-removable;
 	status = "okay";
 };
 
 &eth0 {
 	phy-handle = <&rgmii0>;
 	phy-mode = "rgmii-id";
+	nvmem-cells = <&mac_address0>;
+	nvmem-cell-names = "mac-address";
 	pinctrl-names = "default";
 	pinctrl-0 = <&gmac0_cfg>;
 	rx-internal-delay-ps = <0>;
@@ -53,6 +131,8 @@
 		rgmii0: phy@1 {
 			reg = <0x1>;
 			motorcomm,auto-sleep-disabled;
+			rx-internal-delay-ps = <1950>;
+			tx-internal-delay-ps = <1950>;
 		};
 	};
 };
@@ -60,6 +140,8 @@
 &eth1 {
 	phy-handle = <&rgmii1>;
 	phy-mode = "rgmii-id";
+	nvmem-cells = <&mac_address1>;
+	nvmem-cell-names = "mac-address";
 	pinctrl-names = "default";
 	pinctrl-0 = <&gmac1_cfg>;
 	rx-internal-delay-ps = <0>;
@@ -77,6 +159,8 @@
 		rgmii1: phy@1 {
 			reg = <0x1>;
 			motorcomm,auto-sleep-disabled;
+			rx-internal-delay-ps = <1950>;
+			tx-internal-delay-ps = <1950>;
 		};
 	};
 };
@@ -85,8 +169,219 @@
 	status = "okay";
 };
 
+/*
+ * i2c2 carries the board's AT24C02 MAC EEPROM at 0x50.  This is where the
+ * stable, Xunlong-assigned MACs live -- vendor U-Boot reads them here and
+ * reports a valid TlvInfo block with MAC base c0:74:2b:fa:18:98.
+ * Without this node nothing in the OS can see them, which is why end0/end1
+ * come up with a fresh random locally-administered MAC on every boot while
+ * the two PCIe NICs (whose MACs are in their own EEPROMs) stay stable.
+ *
+ * NOTE: describing the EEPROM does not by itself fix the MACs.  if_smte(4)
+ * only looks at the "local-mac-address"/"mac-address" DT properties and
+ * otherwise calls ether_gen_addr().  The carried driver does not consume the
+ * nvmem cells yet, so the links below document the standard binding and the
+ * exact byte ranges for a later if_smte change or U-Boot DT fixup.
+ */
+&i2c2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c2_0_cfg>;
+	status = "okay";
+
+	eeprom@50 {
+		compatible = "atmel,24c02";
+		reg = <0x50>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		mac_address0: mac-address@0 {
+			reg = <0x0 0x6>;
+		};
+
+		mac_address1: mac-address@6 {
+			reg = <0x6 0x6>;
+		};
+	};
+};
+
+&i2c8 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c8_cfg>;
+	status = "okay";
+
+	pmic@41 {
+		compatible = "spacemit,p1";
+		reg = <0x41>;
+		interrupts = <64>;
+		vin1-supply = <&vcc4v0>;
+		vin2-supply = <&vcc4v0>;
+		vin3-supply = <&vcc4v0>;
+		vin4-supply = <&vcc4v0>;
+		vin5-supply = <&vcc4v0>;
+		vin6-supply = <&vcc4v0>;
+		aldoin-supply = <&vcc4v0>;
+		dldoin1-supply = <&buck5>;
+		dldoin2-supply = <&buck5>;
+
+		regulators {
+			buck1 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3450000>;
+				regulator-ramp-delay = <5000>;
+				regulator-always-on;
+			};
+
+			buck2 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3450000>;
+				regulator-ramp-delay = <5000>;
+				regulator-always-on;
+			};
+
+			buck3_1v8: buck3 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-ramp-delay = <5000>;
+				regulator-always-on;
+			};
+
+			buck4_3v3: buck4 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-ramp-delay = <5000>;
+				regulator-always-on;
+			};
+
+			buck5: buck5 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3450000>;
+				regulator-ramp-delay = <5000>;
+				regulator-always-on;
+			};
+
+			buck6 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3450000>;
+				regulator-ramp-delay = <5000>;
+				regulator-always-on;
+			};
+
+			aldo1: aldo1 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3400000>;
+				regulator-boot-on;
+			};
+
+			aldo2 {
+				/* not connected */
+			};
+
+			aldo3 {
+				/* not connected */
+			};
+
+			aldo4 {
+				/* not connected */
+			};
+
+			dldo1 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3400000>;
+				regulator-boot-on;
+			};
+
+			dldo2 {
+				/* not connected */
+			};
+
+			dldo3 {
+				/* not connected */
+			};
+
+			dldo4 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3400000>;
+				regulator-always-on;
+			};
+
+			dldo5 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3400000>;
+			};
+
+			dldo6 {
+				regulator-min-microvolt = <500000>;
+				regulator-max-microvolt = <3400000>;
+				regulator-always-on;
+			};
+
+			dldo7 {
+				/* not connected */
+			};
+		};
+	};
+};
+
+&pcie1_phy {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie1_3_cfg>;
+	status = "okay";
+};
+
+&pcie1_port {
+	phys = <&pcie1_phy>;
+	vpcie3v3-supply = <&pcie_vcc3v3>;
+};
+
+&pcie1 {
+	status = "okay";
+};
+
+&pcie2_phy {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie2_4_cfg>;
+	status = "okay";
+};
+
+&pcie2_port {
+	phys = <&pcie2_phy>;
+	vpcie3v3-supply = <&pcie_vcc3v3>;
+};
+
+&pcie2 {
+	status = "okay";
+};
+
+/*
+ * No &qspi: the R2S has no QSPI NOR flash.  The vendor's own R2S DTB ships
+ * spi@d420c000 as status = "disabled" while the RV2's is "okay" -- this node,
+ * its pinmux and its partition table were all inherited from the RV2.  The
+ * partition list was never read off an R2S chip either; it is the generic K1
+ * SPI "mtdparts" layout string found in FSBL.bin.  The R2S boots entirely from
+ * eMMC (ROM -> boot0 FSBL -> u-boot.itb at user-area sector 1664), so nothing
+ * here was ever in the boot path.  Enabling it made spibus probe a chip that
+ * is not fitted and held pads 98-103 in QSPI mux (100-103 are also uart4/uart5).
+ */
+
 &uart0 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart0_2_cfg>;
+	status = "okay";
+};
+
+&usbphy2 {
+	status = "okay";
+};
+
+/*
+ * No hub@1/hub@2 children: the R2S has no on-board USB hub.  Those nodes were
+ * inherited from the RV2; the vendor's own R2S DTB has no children under dwc3,
+ * mainline Linux's R2S dts has none, and on hardware the storage device
+ * attaches directly to the root hub (uhub0 reports 2 ports and the device
+ * appears as ugen0.2, with no intermediate hub).
+ */
+&usb_dwc3 {
+	dr_mode = "host";
+	vbus-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
