@@ -222,6 +222,27 @@ rge_sysctl_mac_stats_attach(struct rge_softc *sc)
 	/* uint16_t rge_tx_undrn */
 }
 
+/* Diagnostic switch: retain the production deferred path by default. */
+static int
+rge_sysctl_tx_direct(SYSCTL_HANDLER_ARGS)
+{
+	struct rge_softc *sc = arg1;
+	int error, value;
+
+	RGE_LOCK(sc);
+	value = sc->sc_tx_direct;
+	RGE_UNLOCK(sc);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value != 0 && value != 1)
+		return (EINVAL);
+	RGE_LOCK(sc);
+	sc->sc_tx_direct = value;
+	RGE_UNLOCK(sc);
+	return (0);
+}
+
 void
 rge_sysctl_attach(struct rge_softc *sc)
 {
@@ -231,6 +252,12 @@ rge_sysctl_attach(struct rge_softc *sc)
 	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "debug", CTLFLAG_RW, &sc->sc_debug, 0,
 	    "control debugging printfs");
+
+	sc->sc_tx_direct = 0;
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "tx_direct", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rge_sysctl_tx_direct, "I",
+	    "submit TX inline when no worker is pending (diagnostic)");
 
 	sc->sc_rx_process_limit = 16;
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
