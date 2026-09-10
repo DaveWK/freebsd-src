@@ -344,7 +344,11 @@ LDFLAGS.bfd+= -Wl,--secure-plt
 .endif
 
 .if ${MACHINE_CPUARCH} == "riscv"
+.if defined(RISCV_NO_DEFAULT_MARCH)
+CFLAGS += -mabi=lp64d
+.else
 CFLAGS += -march=rv64imafdc -mabi=lp64d
+.endif
 .endif
 
 # NB: COPTFLAGS is handled in /usr/src/sys/conf/kern.pre.mk
