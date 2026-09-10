@@ -204,6 +204,8 @@ cpu_copy_thread(struct thread *td, struct thread *td0)
 	 */
 	td->td_pcb->pcb_vsaved = NULL;
 	td->td_pcb->pcb_vsflags &= ~PCB_VS_STARTED;
+	/* cpu_switch tests the trap-frame VS bits before restoring state. */
+	td->td_frame->tf_sstatus &= ~SSTATUS_VS_MASK;
 
 	td->td_pcb->pcb_s[0] = (uintptr_t)fork_return;
 	td->td_pcb->pcb_s[1] = (uintptr_t)td;
