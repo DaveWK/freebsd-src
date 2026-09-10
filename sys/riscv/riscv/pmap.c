@@ -991,6 +991,9 @@ pmap_bootstrap(vm_paddr_t kernstart, vm_size_t kernlen)
 		pmap_store(&pte[i], L3_PTE(pa + ptoa(i), PTE_KERN |
 		    pmap_memattr_bits(VM_MEMATTR_DEFAULT)));
 
+	/* Publish the new mappings before the first access. */
+	sfence_vma();
+
 	/* Now, it can be initialized. */
 	dpcpu_init((void *)dpcpu, 0);
 
@@ -1004,6 +1007,9 @@ pmap_bootstrap(vm_paddr_t kernstart, vm_size_t kernlen)
 	for (i = 0; i < howmany(msgbufsize, PAGE_SIZE); i++)
 		pmap_store(&pte[i], L3_PTE(pa + ptoa(i), PTE_KERN |
 		    pmap_memattr_bits(VM_MEMATTR_DEFAULT)));
+
+	/* Discard cached invalid translations before msgbufinit(). */
+	sfence_vma();
 
 #undef	reserve_space
 
