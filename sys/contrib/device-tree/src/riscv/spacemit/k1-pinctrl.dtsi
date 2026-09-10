@@ -551,9 +551,12 @@
 
 	pcie1_3_cfg: pcie1-3-cfg {
 		pcie1-3-pins {
-			pinmux = <K1_PADCONF(59, 4)>,	/* PERST# */
-				 <K1_PADCONF(60, 4)>,	/* WAKE# */
-				 <K1_PADCONF(61, 4)>;	/* CLKREQ# */
+			/* PERST# only.  Muxing CLKREQ# (or WAKE#) puts the K1 PCIe
+			 * wrapper into hardware clock-gated mode; with the RTL8125
+			 * floating CLKREQ# high the DBI clock domain is gated and the
+			 * first config-space access hard-hangs the hart.  PERST# is
+			 * all the controller needs to reset/release the endpoint. */
+			pinmux = <K1_PADCONF(59, 4)>;	/* PERST# */
 
 			bias-pull-up = <0>;
 			drive-strength = <21>;
@@ -562,9 +565,8 @@
 
 	pcie2_4_cfg: pcie2-4-cfg {
 		pcie2-4-pins {
-			pinmux = <K1_PADCONF(62, 4)>,	/* PERST# */
-				 <K1_PADCONF(112, 3)>,	/* WAKE# */
-				 <K1_PADCONF(117, 4)>;	/* CLKREQ# */
+			/* PERST# only -- see pcie1_3_cfg. */
+			pinmux = <K1_PADCONF(62, 4)>;	/* PERST# */
 
 			bias-pull-up = <0>;
 			drive-strength = <21>;
