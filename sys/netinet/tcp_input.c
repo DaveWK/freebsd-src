@@ -1805,6 +1805,10 @@ tcp_do_segment(struct tcpcb *tp, struct mbuf *m, struct tcphdr *th,
 				cc_ack_received(tp, th, nsegs, CC_ACK);
 
 				tp->snd_una = th->th_ack;
+				/* Retire the ISS bound before sequence comparisons wrap. */
+				if (SEQ_GT(tp->snd_una,
+				    tp->iss + (TCP_MAXWIN << tp->snd_scale)))
+					tp->t_flags2 |= TF2_NO_ISS_CHECK;
 				/*
 				 * Pull snd_wl2 up to prevent seq wrap relative
 				 * to th_ack.
