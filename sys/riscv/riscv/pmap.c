@@ -3001,28 +3001,15 @@ pmap_fault(pmap_t pmap, vm_offset_t va, vm_prot_t ftype)
 
 	KASSERT(VIRT_IS_VALID(va), ("pmap_fault: invalid va %#lx", va));
 
-	if (pmap == kernel_pmap) {
-		/*
-		 * Locking the kernel pmap while processing spurious faults
-		 * may lead to a panic since we might be running a critical section
-		 * or already holding the kernel pmap lock.
-		 * We deal with this by taking advantage of the fact that
-		 * kernel PTPs are never freed and performing a lockless lookup
-		 * to determine whether a valid mapping exits.
-		 */
-		pte = pmap_fault_lookup(pmap, va);
-		if (pte != NULL && (pmap_load(pte) & PTE_KERN) == PTE_KERN) {
-			sfence_vma_page(va);
-			return (1);
-		}
-		/*
-		 * The entry is either not present or missing some bits.
-		 * Fall back to the locked lookup below to handle the fault.
-		 */
-	}
-
+	/*
+	 * Kernel page tables are never freed. Handle both spurious TLB
+	 * faults and software A/D updates without a sleepable lock: faults
+	 * can occur during bootstrap, in critical sections, or while the
+	 * kernel pmap lock is already held. Preserve permission checks.
+	 */
 	rv = 0;
-	PMAP_LOCK(pmap);
+	if (pmap != kernel_pmap)
+		PMAP_LOCK(pmap);
 	pte = pmap_fault_lookup(pmap, va);
 	if (pte == NULL || ((oldpte = pmap_load(pte)) & PTE_V) == 0)
 		goto done;
@@ -3047,7 +3034,8 @@ pmap_fault(pmap_t pmap, vm_offset_t va, vm_prot_t ftype)
 	sfence_vma();
 	rv = 1;
 done:
-	PMAP_UNLOCK(pmap);
+	if (pmap != kernel_pmap)
+		PMAP_UNLOCK(pmap);
 	return (rv);
 }
 
