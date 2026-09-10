@@ -139,6 +139,8 @@ static struct ofw_compat_data compat_data[] = {
 static void smte_txeof(struct smte_softc *sc);
 static void smte_rxeof(struct smte_softc *sc);
 static void smte_stop_locked(struct smte_softc *sc);
+static void smte_reset_rings(struct smte_softc *sc);
+static void smte_dma_reset(struct smte_softc *sc);
 static void smte_init_locked(struct smte_softc *sc);
 static void smte_start_locked(if_t ifp);
 static void smte_tick(void *arg);
@@ -405,8 +407,7 @@ smte_rxeof(struct smte_softc *sc)
 			m->m_pkthdr.rcvif = sc->ifp;
 
 			if_inc_counter(sc->ifp, IFCOUNTER_IPACKETS, 1);
-			if_inc_counter(sc->ifp, IFCOUNTER_IBYTES, len);
-			(void)mbufq_enqueue(&mq, m);
+				(void)mbufq_enqueue(&mq, m);
 		}
 
 		/* Reload this slot with a fresh buffer. */
@@ -479,6 +480,12 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 			txd->sd_desc1 |= TX_DESC1_END_RING;
 		if (i == 0)
 			txd->sd_desc1 |= TX_DESC1_FIRST_SEGMENT;
+		/*
+		 * Interrupt on the last segment of every frame: without the
+		 * bit the DMA never raises TX_TRANSFER_DONE, and completed
+		 * frames are only reclaimed when an RX interrupt or the 1 Hz
+		 * tick happens to run smte_txeof().
+		 */
 		if (i == nsegs - 1)
 			txd->sd_desc1 |= TX_DESC1_LAST_SEGMENT |
 			    TX_DESC1_INTERRUPT_ON_COMPLETION;
@@ -511,6 +518,43 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 	sc->tx_used += nsegs;
 
 	return (0);
+}
+
+/*
+ * Return both rings to their post-attach state.  Used by the watchdog
+ * restart path: smte_init_locked() reprograms DMA_{TRANSMIT,RECEIVE}_BASE_
+ * ADDRESS, which parks the hardware back on descriptor 0, so the software
+ * producer/consumer indices have to be rewound to match or the two sides
+ * address different descriptors from then on.
+ */
+static void
+smte_reset_rings(struct smte_softc *sc)
+{
+	int i;
+
+	SMTE_ASSERT_LOCKED(sc);
+
+	for (i = 0; i < SMTE_NTXDESC; i++) {
+		if (sc->txbuf[i].mbuf != NULL) {
+			bus_dmamap_sync(sc->txbuf_tag, sc->txbuf[i].map,
+			    BUS_DMASYNC_POSTWRITE);
+			bus_dmamap_unload(sc->txbuf_tag, sc->txbuf[i].map);
+			m_freem(sc->txbuf[i].mbuf);
+			sc->txbuf[i].mbuf = NULL;
+		}
+		sc->txdesc[i].sd_desc0 = 0;
+		sc->txdesc[i].sd_desc1 = 0;
+	}
+	sc->tx_prod = sc->tx_cons = sc->tx_used = 0;
+	sc->tx_watchdog = 0;
+
+	/* Rx buffers stay mapped; just hand every descriptor back. */
+	for (i = 0; i < SMTE_NRXDESC; i++)
+		sc->rxdesc[i].sd_desc0 = RX_DESC0_OWN;
+	sc->rx_cons = 0;
+
+	bus_dmamap_sync(sc->desc_tag, sc->txdesc_map, BUS_DMASYNC_PREWRITE);
+	bus_dmamap_sync(sc->desc_tag, sc->rxdesc_map, BUS_DMASYNC_PREWRITE);
 }
 
 static void
@@ -595,7 +639,7 @@ smte_start_locked(if_t ifp)
 
 	if (queued > 0) {
 		sc->tx_watchdog = SMTE_WATCHDOG_TIMEOUT;
-		WR4(sc, DMA_TRANSMIT_POLL_DEMAND, 1);
+		WR4(sc, DMA_TRANSMIT_POLL_DEMAND, 0xff);
 	}
 }
 
@@ -634,7 +678,8 @@ smte_intr(void *arg)
 	 * DMA_STATUS_IRQ has sticky state bits that are not write-1-to-clear.
 	 */
 	stat &= (DMA_STATUS_IRQ_RX_TRANSFER_DONE |
-	    DMA_STATUS_IRQ_RX_MISSED_FRAME | DMA_STATUS_IRQ_TX_TRANSFER_DONE);
+	    DMA_STATUS_IRQ_RX_MISSED_FRAME | DMA_STATUS_IRQ_TX_TRANSFER_DONE |
+	    DMA_STATUS_IRQ_TX_DES_UNAVAILABLE | DMA_STATUS_IRQ_TX_DMA_STOPPED);
 	if (stat == 0) {
 		SMTE_UNLOCK(sc);
 		return;
@@ -645,10 +690,24 @@ smte_intr(void *arg)
 	    DMA_STATUS_IRQ_RX_MISSED_FRAME)) != 0)
 		smte_rxeof(sc);
 
-	if ((stat & DMA_STATUS_IRQ_TX_TRANSFER_DONE) != 0) {
+	/*
+	 * TX_DES_UNAVAILABLE is raised when the transmit DMA walks onto a
+	 * descriptor the driver still owns; the engine then suspends and
+	 * stays suspended until the condition is acked above.  Leaving it
+	 * latched is what killed transmit outright: a handful of frames go
+	 * out, the ring drains, the engine suspends, and every subsequent
+	 * DMA_TRANSMIT_POLL_DEMAND is ignored.  Reclaim, then re-arm -- if
+	 * there is nothing new to send but descriptors are still owned by
+	 * hardware, poll demand alone is what restarts it.
+	 */
+	if ((stat & (DMA_STATUS_IRQ_TX_TRANSFER_DONE |
+	    DMA_STATUS_IRQ_TX_DES_UNAVAILABLE |
+	    DMA_STATUS_IRQ_TX_DMA_STOPPED)) != 0) {
 		smte_txeof(sc);
 		if (!if_sendq_empty(sc->ifp))
 			smte_start_locked(sc->ifp);
+		else if (sc->tx_used != 0)
+			WR4(sc, DMA_TRANSMIT_POLL_DEMAND, 0xff);
 	}
 
 	SMTE_UNLOCK(sc);
@@ -712,21 +771,21 @@ smte_init_locked(struct smte_softc *sc)
 
 	/* Enable completion interrupts. */
 	WR4(sc, DMA_INTR_ENABLE, DMA_INTR_ENABLE_TX_TRANSFER_DONE |
+	    DMA_INTR_ENABLE_TX_DES_UNAVAILABLE |
+	    DMA_INTR_ENABLE_TX_DMA_STOPPED |
 	    DMA_INTR_ENABLE_RX_TRANSFER_DONE |
 	    DMA_INTR_ENABLE_RX_MISSED_FRAME |
 	    DMA_INTR_ENABLE_RX_DMA_STOPPED |
 	    DMA_INTR_ENABLE_RX_DES_UNAVAILABLE);
-
-	device_printf(sc->dev,
-	    "DBG init: rx ring pa %#lx desc0[0] %#x desc1[0] %#x addr[0] "
-	    "%#x\n", (u_long)sc->rxdesc_paddr, sc->rxdesc[0].sd_desc0,
-	    sc->rxdesc[0].sd_desc1, sc->rxdesc[0].sd_addr1);
 
 	WR4(sc, MAC_TRANSMIT_CTRL,
 	    (RD4(sc, MAC_TRANSMIT_CTRL) & ~MAC_TRANSMIT_CTRL_IFG_LEN_MASK) |
 	    MAC_TRANSMIT_CTRL_TX_ENABLE | MAC_TRANSMIT_CTRL_TX_AUTO_RETRY);
 	WR4(sc, MAC_RECEIVE_CTRL, RD4(sc, MAC_RECEIVE_CTRL) |
 	    MAC_RECEIVE_CTRL_RX_ENABLE | MAC_RECEIVE_CTRL_STORE_FORWARD);
+
+	/* Clear any status latched from a previous run before restarting. */
+	WR4(sc, DMA_STATUS_IRQ, RD4(sc, DMA_STATUS_IRQ));
 
 	WR4(sc, DMA_TRANSMIT_AUTO_POLL_COUNTER, 0);
 	WR4(sc, DMA_CTRL, RD4(sc, DMA_CTRL) | DMA_CTRL_START_STOP_TX_DMA |
@@ -750,10 +809,40 @@ smte_tick(void *arg)
 	link_was = sc->link;
 	mii_tick(sc->mii);
 
-	if (sc->tx_watchdog > 0 && --sc->tx_watchdog == 0) {
-		device_printf(sc->dev, "watchdog timeout\n");
-		if_inc_counter(sc->ifp, IFCOUNTER_OERRORS, 1);
+	/*
+	 * Reclaim anything hardware finished but did not interrupt for, and
+	 * re-issue poll demand while descriptors are still outstanding: the
+	 * engine suspends whenever it walks onto a descriptor the driver
+	 * still owns, and poll demand is what brings it back.  smte_txeof()
+	 * clears tx_watchdog once the ring drains, so a ring that is merely
+	 * slow no longer trips the watchdog below.
+	 */
+	if (sc->tx_used != 0) {
 		smte_txeof(sc);
+		if (sc->tx_used != 0)
+			WR4(sc, DMA_TRANSMIT_POLL_DEMAND, 0xff);
+	}
+
+	if (sc->tx_watchdog > 0 && --sc->tx_watchdog == 0) {
+		device_printf(sc->dev, "watchdog timeout (DMA_STATUS 0x%08x); "
+		    "restarting\n", RD4(sc, DMA_STATUS_IRQ));
+		if_inc_counter(sc->ifp, IFCOUNTER_OERRORS, 1);
+
+		/*
+		 * smte_init_locked() returns early when IFF_DRV_RUNNING is
+		 * still set, so the interface has to be stopped first or the
+		 * "restart" is a no-op -- and, because smte_tick() returns
+		 * here, the tick callout would never be re-armed either,
+		 * silently killing the watchdog after its first firing.
+		 */
+		smte_txeof(sc);
+		smte_stop_locked(sc);
+		smte_dma_reset(sc);
+		smte_reset_rings(sc);
+		smte_init_locked(sc);
+		if (!if_sendq_empty(sc->ifp))
+			smte_start_locked(sc->ifp);
+		return;
 	}
 
 	if (link_was == 0 && sc->link != 0 && !if_sendq_empty(sc->ifp))
@@ -914,20 +1003,23 @@ smte_hw_init(struct smte_softc *sc)
 	WR4(sc, DMA_CTRL, 0);
 
 	/*
-	 * Route the AXI master, and put the MAC into RGMII mode with the TX
-	 * clock sourced from the SoC.  The clock+reset (bits 0/1) are already
-	 * handled by clk_enable()/hwreset_deassert() in attach; but the RGMII
-	 * interface-select (bit 2) and TX-clock-source (bit 8) are NOT, and the
-	 * reset default is RMII with the wrong TX clock.  A minimal bootloader
-	 * (e.g. our modern U-Boot) that doesn't program these leaves the RGMII
-	 * PHY mis-clocked, so it never answers on MDIO and mii_attach() fails
-	 * with "cannot attach PHY: 6".  Set them here so the driver is
-	 * bootloader-independent.  (These boards are always RGMII -- the RGMII
-	 * delay lines below are programmed unconditionally too.)
+	 * Route the AXI master and put the MAC into RGMII mode with the TX
+	 * clock derived from the PHY's RX clock (bit 8 clear).  That is the
+	 * configuration the vendor DT ("ref-clock-from-phy") and the Linux
+	 * driver use for every RGMII mode.  With bit 8 set ("TX clock from the
+	 * SoC") the MAC's transmit side and its statistics block have no
+	 * running clock on this board: the TX ring completes ten frames into
+	 * the FIFO and stalls for good, nothing reaches the wire, and the stat
+	 * counter reads never finish.  REF_CLK_SEL (bit 3) only applies to RMII
+	 * and is cleared as well.  The clock gate and reset (bits 0/1) are
+	 * handled by clk_enable()/hwreset_deassert() in attach; a bootloader
+	 * that never programs this word (our U-Boot) leaves the reset default,
+	 * RMII, and the PHY then does not even answer on MDIO, so program it
+	 * here to stay bootloader-independent.
 	 */
 	SYSCON_MODIFY_4(sc->apmu, sc->apmu_offset + APMU_EMAC_CLK_RST_CTRL,
-	    0, APMU_EMAC_AXI_MST_ID | APMU_EMAC_PHY_SEL_RGMII |
-	    APMU_EMAC_RGMII_TXC_SRC_SEL);
+	    APMU_EMAC_RGMII_TXC_SRC_SEL | APMU_EMAC_REF_CLK_SEL,
+	    APMU_EMAC_AXI_MST_ID | APMU_EMAC_PHY_SEL_RGMII);
 
 	/* Program RGMII delay lines (ps -> 15.6 ps steps). */
 	rx_delay = (sc->rx_delay_ps * 10 + 78) / 156;
@@ -940,7 +1032,23 @@ smte_hw_init(struct smte_softc *sc)
 	SYSCON_WRITE_4(sc->apmu, sc->apmu_offset + APMU_EMAC_RGMII_DLINE,
 	    val);
 
-	/* Reset the DMA engine. */
+	smte_dma_reset(sc);
+}
+
+/*
+ * Software-reset the DMA engine and reprogram DMA_CONFIG.  Used at attach
+ * and by the watchdog: once the transmit engine has wedged, stopping and
+ * restarting the MAC is not enough, the engine has to be reset before it
+ * will fetch descriptors again.
+ *
+ * The Linux driver programs the same STRICT_BURST | 64BIT | burst-length
+ * word; the vendor U-Boot additionally sets WAIT_FOR_DONE (bit 16), which
+ * is left clear here as Linux does.
+ */
+static void
+smte_dma_reset(struct smte_softc *sc)
+{
+
 	WR4(sc, DMA_CONFIG, DMA_CONFIG_SOFTWARE_RESET);
 	DELAY(10000);
 	WR4(sc, DMA_CONFIG, 0);
