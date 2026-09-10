@@ -1713,6 +1713,9 @@ sdhci_timeout(void *arg)
 		sdhci_dumpregs(slot);
 		SDHCI_RESET(slot->bus, slot,
 		    SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+		slot->intmask &= ~(SDHCI_INT_DATA_AVAIL |
+		    SDHCI_INT_SPACE_AVAIL);
+		WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
 		slot->curcmd->error = MMC_ERR_TIMEOUT;
 		sdhci_req_done(slot);
 	} else {
@@ -1755,6 +1758,12 @@ sdhci_start_command(struct sdhci_slot *slot, struct mmc_command *cmd)
 	uint32_t mask;
 
 	slot->curcmd = cmd;
+	/* Restore CMD interrupts masked on spurious fire with no active command. */
+	if (!(slot->intmask & SDHCI_INT_RESPONSE)) {
+		slot->intmask |= SDHCI_INT_RESPONSE |
+		    SDHCI_INT_CMD_ERROR_MASK;
+		WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
+	}
 	slot->cmd_done = 0;
 
 	cmd->error = MMC_ERR_NONE;
@@ -1892,6 +1901,9 @@ sdhci_finish_command(struct sdhci_slot *slot)
 			slot->retune_req |= SDHCI_RETUNE_REQ_RESET;
 		SDHCI_RESET(slot->bus, slot, SDHCI_RESET_CMD);
 		SDHCI_RESET(slot->bus, slot, SDHCI_RESET_DATA);
+		slot->intmask &= ~(SDHCI_INT_DATA_AVAIL |
+		    SDHCI_INT_SPACE_AVAIL);
+		WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
 		sdhci_start(slot);
 		return;
 	}
@@ -1936,6 +1948,13 @@ sdhci_start_data(struct sdhci_slot *slot, const struct mmc_data *data)
 	}
 
 	slot->data_done = 0;
+
+	/* Restore PIO transfer interrupts masked at end of previous xfer. */
+	if (!(slot->intmask & SDHCI_INT_DATA_AVAIL)) {
+		slot->intmask |= SDHCI_INT_DATA_AVAIL |
+		    SDHCI_INT_SPACE_AVAIL;
+		WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
+	}
 
 	/* Calculate and set data timeout.*/
 	/* XXX: We should have this from mmc layer, now assume 1 sec. */
@@ -2052,6 +2071,9 @@ sdhci_finish_data(struct sdhci_slot *slot)
 			slot->retune_req |= SDHCI_RETUNE_REQ_RESET;
 		SDHCI_RESET(slot->bus, slot, SDHCI_RESET_CMD);
 		SDHCI_RESET(slot->bus, slot, SDHCI_RESET_DATA);
+		slot->intmask &= ~(SDHCI_INT_DATA_AVAIL |
+		    SDHCI_INT_SPACE_AVAIL);
+		WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
 		sdhci_start(slot);
 		return;
 	}
@@ -2224,9 +2246,11 @@ sdhci_cmd_irq(struct sdhci_slot *slot, uint32_t intmask)
 {
 
 	if (!slot->curcmd) {
-		slot_printf(slot, "Got command interrupt 0x%08x, but "
-		    "there is no active command.\n", intmask);
-		sdhci_dumpregs(slot);
+		if (intmask & (SDHCI_INT_RESPONSE | SDHCI_INT_CMD_ERROR_MASK)) {
+			slot->intmask &= ~(SDHCI_INT_RESPONSE |
+			    SDHCI_INT_CMD_ERROR_MASK);
+			WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
+		}
 		return;
 	}
 	if (intmask & SDHCI_INT_TIMEOUT)
@@ -2247,17 +2271,22 @@ sdhci_data_irq(struct sdhci_slot *slot, uint32_t intmask)
 	uint32_t sdma_bbufsz;
 
 	if (!slot->curcmd) {
-		slot_printf(slot, "Got data interrupt 0x%08x, but "
-		    "there is no active command.\n", intmask);
-		sdhci_dumpregs(slot);
+		if (intmask & (SDHCI_INT_DATA_AVAIL |
+		    SDHCI_INT_SPACE_AVAIL)) {
+			slot->intmask &= ~(SDHCI_INT_DATA_AVAIL |
+			    SDHCI_INT_SPACE_AVAIL);
+			WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
+		}
 		return;
 	}
 	if (slot->curcmd->data == NULL &&
 	    (slot->curcmd->flags & MMC_RSP_BUSY) == 0) {
-		slot_printf(slot, "Got data interrupt 0x%08x, but "
-		    "there is no active data operation.\n",
-		    intmask);
-		sdhci_dumpregs(slot);
+		if (intmask & (SDHCI_INT_DATA_AVAIL |
+		    SDHCI_INT_SPACE_AVAIL)) {
+			slot->intmask &= ~(SDHCI_INT_DATA_AVAIL |
+			    SDHCI_INT_SPACE_AVAIL);
+			WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
+		}
 		return;
 	}
 	if (intmask & SDHCI_INT_DATA_TIMEOUT)
@@ -2295,6 +2324,19 @@ sdhci_data_irq(struct sdhci_slot *slot, uint32_t intmask)
 			slot->flags |= PLATFORM_DATA_STARTED;
 		} else
 			sdhci_transfer_pio(slot);
+		/*
+		 * Mask off PIO transfer interrupts once all data has been
+		 * moved.  If the controller re-asserts the buffer-ready
+		 * status before DATA_END arrives, the ISR would re-enter in
+		 * a tight loop holding SDHCI_LOCK and starve the timeout
+		 * callout.
+		 */
+		if (slot->curcmd->data != NULL &&
+		    slot->offset >= slot->curcmd->data->len) {
+			slot->intmask &= ~(SDHCI_INT_DATA_AVAIL |
+			    SDHCI_INT_SPACE_AVAIL);
+			WR4(slot, SDHCI_SIGNAL_ENABLE, slot->intmask);
+		}
 	}
 	/* Handle DMA border. */
 	if (intmask & SDHCI_INT_DMA_END) {
