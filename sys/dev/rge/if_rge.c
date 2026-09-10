@@ -100,6 +100,7 @@ static int	rge_txeof(struct rge_queues *);
 static void	rge_iff_locked(struct rge_softc *);
 static void	rge_add_media_types(struct rge_softc *);
 static void	rge_tx_task(void *, int);
+static void	rge_schedule_tx_locked(struct rge_softc *);
 static void	rge_txq_flush_mbufs(struct rge_softc *sc);
 static void	rge_tick(void *);
 static void	rge_link_state(struct rge_softc *);
@@ -1034,25 +1035,26 @@ rge_qflush_if(if_t ifp)
 	RGE_UNLOCK(sc);
 }
 
-/**
- * @brief Transmit the given frame to the hardware.
- *
- * This routine is called by the network stack to send
- * a frame to the device.
- *
- * For now we simply direct dispatch this frame to the
- * hardware (and thus avoid maintaining our own internal
- * queue)
- */
+/* Schedule once, including while the worker is waiting for RGE_LOCK. */
+static void
+rge_schedule_tx_locked(struct rge_softc *sc)
+{
+	RGE_ASSERT_LOCKED(sc);
+	if (!sc->sc_tx_task_pending) {
+		sc->sc_tx_task_pending = true;
+		taskqueue_enqueue(sc->sc_tq, &sc->sc_tx_task);
+	}
+}
+
+/* Queue a frame for the worker to batch into the hardware ring. */
 static int
 rge_transmit_if(if_t ifp, struct mbuf *m)
 {
 	struct rge_softc *sc = if_getsoftc(ifp);
 	int ret;
 
-	sc->sc_drv_stats.transmit_call_cnt++;
-
 	RGE_LOCK(sc);
+	sc->sc_drv_stats.transmit_call_cnt++;
 	if (sc->sc_stopped == true) {
 		sc->sc_drv_stats.transmit_stopped_cnt++;
 		RGE_UNLOCK(sc);
@@ -1068,11 +1070,10 @@ rge_transmit_if(if_t ifp, struct mbuf *m)
 		m_freem(m);
 		return (ret);
 	}
-	RGE_UNLOCK(sc);
-
-	/* mbuf is owned by the driver, schedule transmit */
-	taskqueue_enqueue(sc->sc_tq, &sc->sc_tx_task);
+	/* Keep queue publication and worker scheduling under the same lock. */
+	rge_schedule_tx_locked(sc);
 	sc->sc_drv_stats.transmit_queued_cnt++;
+	RGE_UNLOCK(sc);
 
 	return (0);
 }
@@ -2379,7 +2380,7 @@ rge_txeof(struct rge_queues *q)
 
 	/* The driver lock protects the queue; only wake a worker with work. */
 	if (!mbufq_empty(&sc->sc_txq))
-		taskqueue_enqueue(sc->sc_tq, &sc->sc_tx_task);
+		rge_schedule_tx_locked(sc);
 
 	return (1);
 }
@@ -2479,6 +2480,8 @@ rge_tx_task(void *arg, int npending)
 	RGE_DPRINTF(sc, RGE_DEBUG_XMIT, "%s: running\n", __func__);
 
 	RGE_LOCK(sc);
+	/* Producers cannot enqueue until this worker finishes its locked drain. */
+	sc->sc_tx_task_pending = false;
 	sc->sc_drv_stats.tx_task_cnt++;
 
 	if (sc->sc_stopped == true) {
