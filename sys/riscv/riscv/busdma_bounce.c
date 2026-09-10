@@ -54,6 +54,7 @@
 #include <machine/atomic.h>
 #include <machine/bus.h>
 #include <machine/md_var.h>
+#include <machine/thead.h>
 #include <machine/bus_dma_impl.h>
 
 #define MAX_BPAGES 4096
@@ -413,6 +414,13 @@ bounce_bus_dmamem_alloc(bus_dma_tag_t dmat, void** vaddr, int flags,
 		return (ENOMEM);
 	}
 	(*mapp)->flags = DMAMAP_FROM_DMAMEM;
+	/*
+	 * Only skip cache maintenance when pmap can encode uncacheable
+	 * memory. Without PBMT support, the requested attribute is ignored.
+	 */
+	if (attr == VM_MEMATTR_UNCACHEABLE &&
+	    (has_svpbmt || has_errata_thead_pbmt))
+		(*mapp)->flags |= DMAMAP_COHERENT;
 
 	/*
 	 * Allocate the buffer from the malloc(9) allocator if...
@@ -631,7 +639,8 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 			sgsize = MIN(sgsize, PAGE_SIZE - (curaddr & PAGE_MASK));
 			curaddr = add_bounce_page(dmat, map, 0, curaddr,
 			    sgsize);
-		} else if ((dmat->bounce_flags & BF_COHERENT) == 0) {
+		} else if ((dmat->bounce_flags & BF_COHERENT) == 0 &&
+		    (map->flags & DMAMAP_COHERENT) == 0) {
 			if (map->sync_count > 0)
 				sl_end = sl->paddr + sl->datacount;
 
@@ -719,7 +728,8 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 			sgsize = MIN(sgsize, buflen);
 			curaddr = add_bounce_page(dmat, map, kvaddr, curaddr,
 			    sgsize);
-		} else if ((dmat->bounce_flags & BF_COHERENT) == 0) {
+		} else if ((dmat->bounce_flags & BF_COHERENT) == 0 &&
+		    (map->flags & DMAMAP_COHERENT) == 0) {
 			if (map->sync_count > 0) {
 				sl_pend = sl->paddr + sl->datacount;
 				sl_vend = sl->vaddr + sl->datacount;
