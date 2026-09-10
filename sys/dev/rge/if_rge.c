@@ -1130,6 +1130,7 @@ rge_transmit_if(if_t ifp, struct mbuf *m)
 	ret = mbufq_enqueue(&sc->sc_txq, m);
 	if (ret != 0) {
 		sc->sc_drv_stats.transmit_full_cnt++;
+		if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
 		RGE_UNLOCK(sc);
 		m_freem(m);
 		return (ret);
