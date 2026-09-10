@@ -51,6 +51,7 @@
 #include <sys/module.h>
 #include <sys/reboot.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 #include <sys/time.h>
 
 #include <dev/iicbus/iiconf.h>
@@ -166,6 +167,9 @@ static const struct p1_regdef p1_regdefs[] = {
 struct spacemit_p1_softc {
 	device_t	dev;
 	eventhandler_tag off_tag;
+	eventhandler_tag arm_tag;
+	struct timeout_task deadman;	/* fires if shutdown stalls */
+	int		deadman_howto;
 	uint8_t		rtc_ctl_at_attach; /* RTC_CTRL 0x1d after 32KOUT enable */
 	struct intr_config_hook	lpo_hook; /* deferred 32KOUT enable (post-intr) */
 };
@@ -233,6 +237,19 @@ SYSCTL_INT(_hw_spacemit_p1, OID_AUTO, reset_on_reboot,
     CTLFLAG_RDTUN, &spacemit_p1_reset_on_reboot, 0,
     "Reset the SoC via the PMIC on reboot; the K1 has no working SBI SRST. "
     "Default 1; 0 leaves reboot to cpu_reset(), which hangs this board.");
+
+/*
+ * Optional post-sync recovery deadline. The earlier K1 watchdog hook used
+ * to spin forever before the PMIC callback. That hook is now bounded;
+ * retain the tested deadman as a fallback for other stalled shutdowns.
+ * This is not proof that all device caches have completed their flush.
+ * Set to zero to disable the fallback while diagnosing shutdown.
+ */
+static int spacemit_p1_reset_deadman = 15;
+SYSCTL_INT(_hw_spacemit_p1, OID_AUTO, reset_deadman, CTLFLAG_RWTUN,
+    &spacemit_p1_reset_deadman, 0,
+    "Seconds after sync before resetting the SoC anyway if shutdown stalls. "
+    "Default 15; 0 disables the fallback.");
 
 struct p1_reg_sc {
 	struct regnode		*regnode;
@@ -686,6 +703,88 @@ spacemit_p1_settime(device_t dev, struct timespec *ts)
 }
 
 /*
+ * Do the actual PMIC hand-off.  Shared by the shutdown_final handler and the
+ * deadman, so both take exactly the same path.
+ */
+static void
+p1_pmic_handover(struct spacemit_p1_softc *sc, uint8_t bit)
+{
+	uint8_t val;
+
+	if (p1_read1(sc->dev, P1_PWR_CTRL2, &val) != 0)
+		val = 0;
+	if (p1_write1(sc->dev, P1_PWR_CTRL2, val | bit) != 0) {
+		device_printf(sc->dev, "PWR_CTRL2 write failed\n");
+		return;
+	}
+
+	/*
+	 * The PMIC acts asynchronously.  Give it time to pull the rails rather
+	 * than racing on into shutdown_reset() -> cpu_reset().  Bounded, so a
+	 * PMIC that ignores us still falls through to the old behaviour
+	 * instead of wedging here.
+	 */
+	DELAY(1000000);
+}
+
+/*
+ * Which PWR_CTRL2 bit a given howto asks for, or 0 for "not ours".
+ */
+static uint8_t
+p1_howto_bit(int howto)
+{
+
+	if ((howto & RB_POWEROFF) != 0)
+		return (P1_PWR_CTRL2_SHUTDOWN);
+	if ((howto & (RB_HALT | RB_POWERCYCLE)) == RB_HALT)
+		return (0);
+	if (spacemit_p1_reset_on_reboot == 0)
+		return (0);
+	return (P1_PWR_CTRL2_RST);
+}
+
+/*
+ * Deadman: runs on the shared taskqueue thread, so it may sleep -- which it
+ * must, because every register access here is an iicbus transfer issued with
+ * IIC_INTRWAIT.
+ */
+static void
+p1_reset_deadman(void *arg, int pending __unused)
+{
+	struct spacemit_p1_softc *sc = arg;
+	uint8_t bit;
+
+	bit = p1_howto_bit(sc->deadman_howto);
+	if (bit == 0)
+		return;
+
+	device_printf(sc->dev,
+	    "shutdown stalled for %ds; handing over to the PMIC\n",
+	    spacemit_p1_reset_deadman);
+	p1_pmic_handover(sc, bit);
+}
+
+/*
+ * shutdown_post_sync(9) handler, at SHUTDOWN_PRI_FIRST: arm the deadman
+ * before any device teardown gets a chance to stall, then get out of the way
+ * so the normal shutdown path can run to completion if it is able to.
+ */
+static void
+p1_shutdown_arm(void *arg, int howto)
+{
+	struct spacemit_p1_softc *sc = arg;
+
+	if (spacemit_p1_reset_deadman <= 0)
+		return;
+	if (p1_howto_bit(howto) == 0)
+		return;
+
+	sc->deadman_howto = howto;
+	taskqueue_enqueue_timeout(taskqueue_thread, &sc->deadman,
+	    hz * spacemit_p1_reset_deadman);
+}
+
+/*
  * shutdown_final(9) handler: hand the machine over to the PMIC.
  *
  *   RB_POWEROFF	 -> PWR_CTRL2 bit 2, the PMIC's shutdown request.  This
@@ -718,33 +817,16 @@ static void
 p1_shutdown_final(void *arg, int howto)
 {
 	struct spacemit_p1_softc *sc = arg;
-	uint8_t bit, val;
+	uint8_t bit;
 
-	if ((howto & RB_POWEROFF) != 0) {
-		bit = P1_PWR_CTRL2_SHUTDOWN;
-	} else if ((howto & (RB_HALT | RB_POWERCYCLE)) == RB_HALT) {
+	bit = p1_howto_bit(howto);
+	if (bit == 0)
 		return;
-	} else {
-		if (spacemit_p1_reset_on_reboot == 0)
-			return;
-		bit = P1_PWR_CTRL2_RST;
+
+	if (bit == P1_PWR_CTRL2_RST)
 		device_printf(sc->dev, "resetting the SoC via PWR_CTRL2\n");
-	}
 
-	if (p1_read1(sc->dev, P1_PWR_CTRL2, &val) != 0)
-		val = 0;
-	if (p1_write1(sc->dev, P1_PWR_CTRL2, val | bit) != 0) {
-		device_printf(sc->dev, "PWR_CTRL2 write failed\n");
-		return;
-	}
-
-	/*
-	 * The PMIC acts asynchronously.  Give it time to pull the rails rather
-	 * than racing on into shutdown_reset() -> cpu_reset().  Bounded, so a
-	 * PMIC that ignores us still falls through to the old behaviour
-	 * instead of wedging here.
-	 */
-	DELAY(1000000);
+	p1_pmic_handover(sc, bit);
 }
 
 static int
@@ -942,6 +1024,12 @@ spacemit_p1_attach(device_t dev)
 	sc->off_tag = EVENTHANDLER_REGISTER(shutdown_final, p1_shutdown_final,
 	    sc, SHUTDOWN_PRI_LAST + 150);
 
+	/* Arm the fallback after filesystem sync, before device teardown. */
+	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->deadman, 0, p1_reset_deadman,
+	    sc);
+	sc->arm_tag = EVENTHANDLER_REGISTER(shutdown_post_sync,
+	    p1_shutdown_arm, sc, SHUTDOWN_PRI_FIRST);
+
 	/*
 	 * Register the power-off-persistent RTC.  1s resolution; higher
 	 * priority than the SoC mrvl RTC so this (cold-boot-surviving) clock
@@ -960,6 +1048,11 @@ spacemit_p1_detach(device_t dev)
 	sc = device_get_softc(dev);
 	if (sc->off_tag != NULL)
 		EVENTHANDLER_DEREGISTER(shutdown_final, sc->off_tag);
+	if (sc->arm_tag != NULL) {
+		EVENTHANDLER_DEREGISTER(shutdown_post_sync, sc->arm_tag);
+		taskqueue_cancel_timeout(taskqueue_thread, &sc->deadman, NULL);
+		taskqueue_drain_timeout(taskqueue_thread, &sc->deadman);
+	}
 	return (0);
 }
 
