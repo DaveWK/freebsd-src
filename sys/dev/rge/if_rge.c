@@ -574,6 +574,18 @@ rge_detach(device_t dev)
 
 	RGE_UNLOCK(sc);
 
+	/*
+	 * The interrupt handler delivers detached RX mbufs after dropping
+	 * RGE_LOCK. Drain it before freeing queues, DMA maps or the ifnet.
+	 */
+	for (i = 0; i < RGE_MSI_MESSAGES; i++) {
+		if (sc->sc_ih[i] != NULL) {
+			bus_teardown_intr(sc->sc_dev, sc->sc_irq[i],
+			    sc->sc_ih[i]);
+			sc->sc_ih[i] = NULL;
+		}
+	}
+
 	/* Free taskqueue */
 	if (sc->sc_tq != NULL) {
 		taskqueue_free(sc->sc_tq);
@@ -611,15 +623,6 @@ rge_detach(device_t dev)
 	RGE_DPRINTF(sc, RGE_DEBUG_SETUP, "%s: sc_dmat\n", __func__);
 	if (sc->sc_dmat)
 		bus_dma_tag_destroy(sc->sc_dmat);
-
-	/* Teardown interrupts */
-	for (i = 0; i < RGE_MSI_MESSAGES; i++) {
-		if (sc->sc_ih[i] != NULL) {
-			bus_teardown_intr(sc->sc_dev, sc->sc_irq[i],
-			    sc->sc_ih[i]);
-			sc->sc_ih[i] = NULL;
-		}
-	}
 
 	/* Free interrupt resources */
 	for (i = 0, rid = 1; i < RGE_MSI_MESSAGES; i++, rid++) {
