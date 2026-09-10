@@ -15,3 +15,6 @@ nooptions	DIAGNOSTIC
 # Keep kern.mk ISA/ABI restrictions; RVV is for userland.
 makeoptions COPTFLAGS="-O2 -pipe"
 makeoptions CONF_CFLAGS="-mtune=spacemit-x60"
+
+# EEPROM must be available before the pre-netif MAC assignment service.
+device icee
