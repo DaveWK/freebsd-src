@@ -668,7 +668,11 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	/*
 	 * Did we fit?
 	 */
-	return (buflen != 0 ? EFBIG : 0); /* XXX better return value here? */
+	if (buflen != 0) {
+		bus_dmamap_unload(dmat, map);
+		return (EFBIG);
+	}
+	return (0);
 }
 
 /*
@@ -767,7 +771,11 @@ cleanup:
 	/*
 	 * Did we fit?
 	 */
-	return (buflen != 0 ? EFBIG : 0); /* XXX better return value here? */
+	if (buflen != 0) {
+		bus_dmamap_unload(dmat, map);
+		return (EFBIG);
+	}
+	return (0);
 }
 
 static void
