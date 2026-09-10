@@ -83,9 +83,14 @@ k1_reset_final(void *arg __unused, int howto)
 	wdt_wr(WDT_WSR, 0x0);
 	wdt_wr(WDT_WCR, 0x1);
 
-	/* Spin until the watchdog resets the SoC. */
-	for (;;)
-		cpu_spinwait();
+	/*
+	 * A watchdog that does not reset must not strand later reset providers.
+	 * In particular, the R2S PMIC handler runs after this callback.  Allow
+	 * four nominal watchdog periods, then disarm and let shutdown proceed.
+	 */
+	DELAY(1000000);
+	wdt_wr(WDT_WMER, 0x0);
+	printf("spacemit_reset: watchdog reset timed out; continuing shutdown\n");
 }
 
 /*
