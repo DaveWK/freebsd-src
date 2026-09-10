@@ -364,6 +364,8 @@
  */
 
 &uart0 {
+	/* Firmware leaves the console UART on its 14.7456 MHz reference. */
+	clock-frequency = <14745600>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart0_2_cfg>;
 	status = "okay";
@@ -384,4 +386,27 @@
 	dr_mode = "host";
 	vbus-supply = <&vcc5v0_usb>;
 	status = "okay";
+};
+
+/* Platform services absent from the pinned upstream SoC description. */
+/ {
+    soc {
+	thermal: thermal@d4018000 {
+		compatible = "spacemit,k1-tsensor";
+		reg = <0x0 0xd4018000 0x0 0x100>;
+		clocks = <&syscon_apbc CLK_TSEN>, <&syscon_apbc CLK_TSEN_BUS>;
+		clock-names = "core", "bus";
+		interrupts = <61>;
+		resets = <&syscon_apbc RESET_TSEN>;
+		#thermal-sensor-cells = <1>;
+	};
+
+	crng: crng@f0703800 {
+		compatible = "spacemit,hw_crng";
+		reg = <0x0 0xf0703800 0x0 0x100>;
+		clocks = <&syscon_apmu CLK_AES>;
+		resets = <&syscon_apmu RESET_AES>;
+		status = "okay";
+	};
+};
 };
