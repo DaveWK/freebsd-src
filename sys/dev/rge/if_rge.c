@@ -21,6 +21,9 @@
 
 /*	$OpenBSD: if_rge.c,v 1.38 2025/09/19 00:41:14 kevlo Exp $	*/
 
+#include "opt_inet.h"
+#include "opt_inet6.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/sockio.h>
@@ -39,6 +42,9 @@
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+#if defined(INET) || defined(INET6)
+#include <netinet/tcp_lro.h>
+#endif
 
 #include <net/bpf.h>
 #include <net/ethernet.h>
@@ -178,6 +184,19 @@ rge_attach_if(struct rge_softc *sc, const char *eaddr)
 	if_setcapenable(sc->sc_ifp, if_getcapabilities(sc->sc_ifp));
 
 	if_setifheaderlen(sc->sc_ifp, sizeof(struct ether_vlan_header));
+
+#if defined(INET) || defined(INET6)
+	/* Optional endpoint optimization. Routers retain ordinary RX by default. */
+	sc->sc_lro = malloc(sizeof(*sc->sc_lro), M_DEVBUF, M_NOWAIT | M_ZERO);
+	if (sc->sc_lro != NULL) {
+		if (tcp_lro_init_args(sc->sc_lro, sc->sc_ifp, 128, 0) == 0)
+			if_setcapabilitiesbit(sc->sc_ifp, IFCAP_LRO, 0);
+		else {
+			free(sc->sc_lro, M_DEVBUF);
+			sc->sc_lro = NULL;
+		}
+	}
+#endif
 
 	/* TODO: is this needed for iftransmit? */
 	if_setsendqlen(sc->sc_ifp, RGE_TX_LIST_CNT - 1);
@@ -592,6 +611,15 @@ rge_detach(device_t dev)
 		sc->sc_tq = NULL;
 	}
 
+#if defined(INET) || defined(INET6)
+	/* Interrupt delivery has drained, so no LRO operation can still run. */
+	if (sc->sc_lro != NULL) {
+		tcp_lro_free(sc->sc_lro);
+		free(sc->sc_lro, M_DEVBUF);
+		sc->sc_lro = NULL;
+	}
+#endif
+
 	/* Free descriptor memory */
 	RGE_DPRINTF(sc, RGE_DEBUG_SETUP, "%s: freemem\n", __func__);
 	rge_freemem(sc);
@@ -665,6 +693,10 @@ rge_intr_msi(void *arg)
 	struct rge_queues *q = sc->sc_queues;
 	uint32_t status;
 	int claimed = 0, rv;
+#if defined(INET) || defined(INET6)
+	uint64_t lro_flushed;
+	bool do_lro;
+#endif
 
 	sc->sc_drv_stats.intr_cnt++;
 
@@ -738,14 +770,37 @@ rge_intr_msi(void *arg)
 	RGE_WRITE_4(sc, RGE_IMR, sc->rge_intrs);
 
 done:
+#if defined(INET) || defined(INET6)
+	do_lro = sc->sc_lro != NULL &&
+	    (if_getcapenable(sc->sc_ifp) & IFCAP_LRO) != 0;
+	lro_flushed = do_lro ? sc->sc_lro->lro_flushed : 0;
+#endif
 	RGE_UNLOCK(sc);
 
 	NET_EPOCH_ENTER(et);
 	/* Handle any RX frames, outside of the driver lock */
 	while ((m = mbufq_dequeue(&rx_mq)) != NULL) {
 		sc->sc_drv_stats.recv_input_cnt++;
+#if defined(INET) || defined(INET6)
+		if (do_lro) {
+			/* tcp_lro_rx rejects forwarding and invalid checksums. */
+			if (tcp_lro_rx(sc->sc_lro, m, 0) == 0) {
+				sc->sc_drv_stats.rx_lro_queued++;
+				continue;
+			}
+			/* Preserve ordering before delivering an unaggregated frame. */
+			tcp_lro_flush_all(sc->sc_lro);
+		}
+#endif
 		if_input(sc->sc_ifp, m);
 	}
+#if defined(INET) || defined(INET6)
+	if (do_lro) {
+		tcp_lro_flush_all(sc->sc_lro);
+		sc->sc_drv_stats.rx_lro_flushed +=
+		    sc->sc_lro->lro_flushed - lro_flushed;
+	}
+#endif
 	NET_EPOCH_EXIT(et);
 
 	(void) claimed;
@@ -1000,6 +1055,11 @@ rge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 				if_togglecapenable(ifp, IFCAP_VLAN_HWTAGGING);
 				reinit = 1;
 			}
+
+			/* LRO is software-only and needs no hardware reset. */
+			if ((mask & IFCAP_LRO) != 0 &&
+			    (if_getcapabilities(ifp) & IFCAP_LRO) != 0)
+				if_togglecapenable(ifp, IFCAP_LRO);
 
 			if ((mask & IFCAP_WOL_MAGIC) != 0 &&
 			    (if_getcapabilities(ifp) & IFCAP_WOL_MAGIC) != 0)
