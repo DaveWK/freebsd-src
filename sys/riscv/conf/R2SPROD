@@ -10,3 +10,8 @@ nooptions	QUEUE_MACRO_DEBUG_TRASH
 nooptions	BUF_TRACKING
 nooptions	FULL_BUF_TRACKING
 nooptions	DIAGNOSTIC
+
+# X60 scheduling applies to the kernel and all loadable modules.
+# Keep kern.mk ISA/ABI restrictions; RVV is for userland.
+makeoptions COPTFLAGS="-O2 -pipe"
+makeoptions CONF_CFLAGS="-mtune=spacemit-x60"
