@@ -222,11 +222,38 @@ vector_copy_thread(struct thread *td1, struct thread *td2)
 static void
 vector_thread_dtor(void *arg __unused, struct thread *td)
 {
-	void *datap;
 
-	datap = td->td_pcb->pcb_vsaved;
+	/*
+	 * Thread structures are recycled through UMA, and nothing clears
+	 * pcb_vsaved on reuse.  Freeing it without clearing it here lets a
+	 * recycled thread that never allocated a vector context free the
+	 * previous owner's buffer a second time:
+	 *
+	 *   panic: Duplicate free of 0x... from zone ...(malloc-1024)
+	 *       vector_thread_dtor() thread_reap_domain() thread_wait()
+	 *
+	 * malloc-1024 is the save area itself: VLEN=256 * 32 registers.
+	 * Observed on a SpacemiT K1 running userland built with RVV enabled.
+	 * free(NULL) is a no-op, so the NULL case needs no test.
+	 */
+	free(td->td_pcb->pcb_vsaved, M_RVV_CTX);
+	td->td_pcb->pcb_vsaved = NULL;
 
-	free(datap, M_RVV_CTX);
+	/*
+	 * PCB_VS_STARTED has to go with it.  The flag and the buffer are one
+	 * invariant: cpu_fork() tests only the flag before calling
+	 * vector_state_store(), which asserts the buffer is non-NULL.
+	 * Clearing the pointer while leaving the flag set hands a recycled
+	 * thread a context it no longer owns:
+	 *
+	 *   panic: VS area is NULL
+	 *
+	 * Observed on a SpacemiT K1 building packages, in a fork off a
+	 * recycled thread.  Leaving both clear is also what trap.c expects:
+	 * the first vector instruction re-runs vector_state_init(), which
+	 * asserts pcb_vsaved == NULL.
+	 */
+	td->td_pcb->pcb_vsflags &= ~PCB_VS_STARTED;
 }
 
 static void
