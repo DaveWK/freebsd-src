@@ -1056,6 +1056,7 @@ rge_transmit_if(if_t ifp, struct mbuf *m)
 	if (sc->sc_stopped == true) {
 		sc->sc_drv_stats.transmit_stopped_cnt++;
 		RGE_UNLOCK(sc);
+		m_freem(m);
 		return (ENETDOWN);	/* TODO: better error? */
 	}
 
@@ -1064,6 +1065,7 @@ rge_transmit_if(if_t ifp, struct mbuf *m)
 	if (ret != 0) {
 		sc->sc_drv_stats.transmit_full_cnt++;
 		RGE_UNLOCK(sc);
+		m_freem(m);
 		return (ret);
 	}
 	RGE_UNLOCK(sc);
