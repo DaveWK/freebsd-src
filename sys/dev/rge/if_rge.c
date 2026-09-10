@@ -1768,7 +1768,7 @@ rge_freemem(struct rge_softc *sc)
 				bus_dmamap_unload(sc->sc_dmat_tx_buf,
 				    tx->txq_dmamap);
 			}
-			m_free(tx->txq_mbuf);
+			m_freem(tx->txq_mbuf);
 			tx->txq_mbuf = NULL;
 		}
 
@@ -1799,7 +1799,7 @@ rge_freemem(struct rge_softc *sc)
 				bus_dmamap_unload(sc->sc_dmat_rx_buf,
 				    rx->rxq_dmamap);
 			}
-			m_free(rx->rxq_mbuf);
+			m_freem(rx->rxq_mbuf);
 			rx->rxq_mbuf = NULL;
 		}
 
@@ -1816,7 +1816,7 @@ rge_freemem(struct rge_softc *sc)
 		bus_dmamem_free(sc->sc_dmat_rx_desc, q->q_rx.rge_rx_list,
 		    q->q_rx.rge_rx_list_map);
 	}
-	memset(&q->q_rx, 0, sizeof(q->q_tx));
+	memset(&q->q_rx, 0, sizeof(q->q_rx));
 
 	return (0);
 }
