@@ -888,6 +888,14 @@ process_event(char *buffer)
 			sp++;
 		if (strncmp(sp, "at ", 3) == 0)
 			sp += 3;
+		/*
+		 * A device with an empty location string (every FDT node,
+		 * for one) arrives as "? at  name=... on bus": skip the
+		 * whitespace or chop_var() returns false at once and neither
+		 * the pnpinfo variables nor $bus are ever set.
+		 */
+		while (isspace(*sp))
+			sp++;
 		sp = cfg.set_vars(sp);
 		while (isspace(*sp))
 			sp++;
@@ -905,6 +913,8 @@ process_event(char *buffer)
 			sp++;
 		if (strncmp(sp, "at ", 3) == 0)
 			sp += 3;
+		while (isspace(*sp))	/* empty location, as above */
+			sp++;
 		sp = cfg.set_vars(sp);
 		while (isspace(*sp))
 			sp++;
