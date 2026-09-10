@@ -107,7 +107,7 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "recv_input_cnt",
 	    CTLFLAG_RD, &sc->sc_drv_stats.recv_input_cnt,
-	        "calls to if_input to process frames");
+	        "received frames delivered to the stack or LRO");
 
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_desc_err_multidesc",
 	    CTLFLAG_RD, &sc->sc_drv_stats.rx_desc_err_multidesc,
@@ -116,6 +116,11 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_watchdog_timeout_cnt",
 	    CTLFLAG_RD, &sc->sc_drv_stats.tx_watchdog_timeout_cnt,
 	        "TX watchdog timeouts");
+
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_lro_queued", CTLFLAG_RD,
+	    &sc->sc_drv_stats.rx_lro_queued, "RX packets accepted by software LRO");
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_lro_flushed", CTLFLAG_RD,
+	    &sc->sc_drv_stats.rx_lro_flushed, "Aggregated LRO packets delivered");
 
 	/* TX encap counters */
 
