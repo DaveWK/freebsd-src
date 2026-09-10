@@ -24,12 +24,16 @@
 #define	 DMA_STATUS_IRQ_RX_DMA_STOPPED		(1U << 6)
 #define	 DMA_STATUS_IRQ_RX_DES_UNAVAILABLE	(1U << 5)
 #define	 DMA_STATUS_IRQ_RX_TRANSFER_DONE	(1U << 4)
+#define	 DMA_STATUS_IRQ_TX_DMA_STOPPED		(1U << 2)
+#define	 DMA_STATUS_IRQ_TX_DES_UNAVAILABLE	(1U << 1)
 #define	 DMA_STATUS_IRQ_TX_TRANSFER_DONE	(1U << 0)
 #define	DMA_INTR_ENABLE				0x000c
 #define	 DMA_INTR_ENABLE_RX_MISSED_FRAME	(1U << 7)
 #define	 DMA_INTR_ENABLE_RX_DMA_STOPPED		(1U << 6)
 #define	 DMA_INTR_ENABLE_RX_DES_UNAVAILABLE	(1U << 5)
 #define	 DMA_INTR_ENABLE_RX_TRANSFER_DONE	(1U << 4)
+#define	 DMA_INTR_ENABLE_TX_DMA_STOPPED		(1U << 2)
+#define	 DMA_INTR_ENABLE_TX_DES_UNAVAILABLE	(1U << 1)
 #define	 DMA_INTR_ENABLE_TX_TRANSFER_DONE	(1U << 0)
 #define	DMA_TRANSMIT_AUTO_POLL_COUNTER		0x0010
 #define	DMA_TRANSMIT_POLL_DEMAND		0x0014
@@ -81,7 +85,8 @@
 #define	APMU_EMAC_CLK_RST_CTRL			0x0000
 #define	 APMU_EMAC_AXI_MST_ID			(1U << 13)
 #define	 APMU_EMAC_PHY_INTR_EN			(1U << 12)
-#define	 APMU_EMAC_RGMII_TXC_SRC_SEL		(1U << 8)
+#define	 APMU_EMAC_RGMII_TXC_SRC_SEL		(1U << 8)  /* RGMII: 0=TX clk from RX clk, 1=from SoC */
+#define	 APMU_EMAC_REF_CLK_SEL			(1U << 3)  /* RMII only: 0=ref clk from PHY, 1=from SoC */
 #define	 APMU_EMAC_PHY_SEL_RGMII		(1U << 2)  /* 0=RMII, 1=RGMII */
 #define	APMU_EMAC_RGMII_DLINE			0x0004
 #define	 APMU_EMAC_RGMII_DLINE_TX_DELAY_MASK	(0xff << 24)
@@ -117,8 +122,25 @@ struct smte_desc {
 
 /* Tx bits */
 #define	TX_DESC0_OWN				(1U << 31)
+/*
+ * Tx descriptor control bits, taken from the vendor U-Boot K1 EMAC driver
+ * (EMAC_DESC_FD / _LD / _EOR / _BUFF_SIZE1).  FIRST is bit 30 and LAST is
+ * bit 29 -- the reverse of the Synopsys layout this block otherwise
+ * resembles, and they were transposed here.  Bit 31 of des1 is not a
+ * control bit at all: the vendor driver never writes it.
+ */
 #define	TX_DESC1_SIZE1_MASK			(0xfff << 0)
+/*
+ * Bit layout per the Linux driver (k1_emac.h): FIRST is bit 29, LAST is
+ * bit 30 and INTERRUPT_ON_COMPLETION is bit 31.  (The *receive* descriptor
+ * has FIRST at 30 and LAST at 29 -- do not copy that here.)
+ */
+#define	TX_DESC1_SIZE2_MASK			(0xfff << 12)
+#define	TX_DESC1_FORCE_EOP_ERROR		(1U << 24)
+#define	TX_DESC1_SECOND_ADDRESS_CHAINED		(1U << 25)
 #define	TX_DESC1_END_RING			(1U << 26)
+#define	TX_DESC1_DISABLE_PADDING		(1U << 27)
+#define	TX_DESC1_ADD_CRC_DISABLE		(1U << 28)
 #define	TX_DESC1_FIRST_SEGMENT			(1U << 29)
 #define	TX_DESC1_LAST_SEGMENT			(1U << 30)
 #define	TX_DESC1_INTERRUPT_ON_COMPLETION	(1U << 31)
