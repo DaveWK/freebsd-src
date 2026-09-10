@@ -65,6 +65,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <dev/clk/clk.h>
+#include <dev/hwreset/hwreset.h>
 #include <dev/regulator/regulator.h>
 #include <dev/phy/phy_usb.h>
 #endif
@@ -312,7 +313,12 @@ snps_dwc3_reset(struct snps_dwc3_softc *sc)
 		phy3 &= ~DWC3_GUSB3PIPECTL0_SUSPENDUSB3;
 	DWC3_WRITE(sc, DWC3_GUSB3PIPECTL0, phy3);
 
-	DELAY(1000);
+#ifdef FDT
+	if (ofw_bus_is_compatible(sc->dev, "spacemit,k1-dwc3"))
+		DELAY(100000);
+	else
+#endif
+		DELAY(1000);
 
 	phy2 &= ~DWC3_GUSB2PHYCFG0_PHYSOFTRST;
 	DWC3_WRITE(sc, DWC3_GUSB2PHYCFG0, phy2);
@@ -320,8 +326,16 @@ snps_dwc3_reset(struct snps_dwc3_softc *sc)
 	phy3 &= ~DWC3_GUSB3PIPECTL0_PHYSOFTRST;
 	DWC3_WRITE(sc, DWC3_GUSB3PIPECTL0, phy3);
 
+#ifdef FDT
+	if (ofw_bus_is_compatible(sc->dev, "spacemit,k1-dwc3"))
+		DELAY(100000);
+#endif
 	gctl &= ~DWC3_GCTL_CORESOFTRESET;
 	DWC3_WRITE(sc, DWC3_GCTL, gctl);
+#ifdef FDT
+	if (ofw_bus_is_compatible(sc->dev, "spacemit,k1-dwc3"))
+		DELAY(10000);
+#endif
 
 }
 
@@ -509,6 +523,20 @@ snps_dwc3_common_attach(device_t dev, bool is_fdt)
 
 	node = ofw_bus_get_node(dev);
 
+	/* K1 requires all three gates, including both AXI clocks. */
+	if (ofw_bus_is_compatible(dev, "spacemit,k1-dwc3")) {
+		hwreset_t rst;
+		int i;
+
+		(void)clk_get_by_ofw_name(dev, node, "usbdrd30", &sc->clk_ref);
+		(void)clk_get_by_ofw_name(dev, node, "usb-axi", &sc->clk_bus);
+		(void)clk_get_by_ofw_name(dev, node, "usb-p1", &sc->clk_suspend);
+		for (i = 0; hwreset_get_by_ofw_idx(dev, node, i, &rst) == 0; i++) {
+			(void)hwreset_deassert(rst);
+			(void)hwreset_release(rst);
+		}
+	}
+
 	/* Get the clocks if any */
 	if (ofw_bus_is_compatible(dev, "rockchip,rk3328-dwc3") == 1 ||
 	    ofw_bus_is_compatible(dev, "rockchip,rk3568-dwc3") == 1) {
@@ -615,6 +643,7 @@ skip_phys:
 #ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{ "snps,dwc3",	1 },
+	{ "spacemit,k1-dwc3",	1 },
 	{ NULL,		0 }
 };
 
