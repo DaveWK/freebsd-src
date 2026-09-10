@@ -62,8 +62,10 @@ struct rge_drv_stats {
 	/* How many times tx_task was run */
 	uint64_t		tx_task_cnt;
 
-	/* Count of frames passed up into if_input() */
+	/* Count of received frames delivered to the stack or LRO. */
 	uint64_t		recv_input_cnt;
+	uint64_t		rx_lro_queued;
+	uint64_t		rx_lro_flushed;
 
 	/*
 	 * For now - driver doesn't support multi descriptor
@@ -212,6 +214,7 @@ struct rge_softc {
 	struct rge_drv_stats	sc_drv_stats;
 
 	struct rge_mac_stats	sc_mac_stats;
+	struct lro_ctrl		*sc_lro;
 };
 
 /*
