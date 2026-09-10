@@ -185,6 +185,7 @@ struct rge_softc {
 	char			sc_tq_name[32];
 	char			sc_tq_thr_name[32];
 	struct task		sc_tx_task;
+	bool			sc_tx_task_pending; /* protected by RGE_LOCK */
 
 	struct callout		sc_timeout;	/* 1 second tick */
 
