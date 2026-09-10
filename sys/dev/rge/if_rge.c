@@ -100,6 +100,7 @@ static int	rge_txeof(struct rge_queues *);
 static void	rge_iff_locked(struct rge_softc *);
 static void	rge_add_media_types(struct rge_softc *);
 static void	rge_tx_task(void *, int);
+static void	rge_tx_drain_locked(struct rge_softc *);
 static void	rge_schedule_tx_locked(struct rge_softc *);
 static void	rge_txq_flush_mbufs(struct rge_softc *sc);
 static void	rge_tick(void *);
@@ -1046,7 +1047,7 @@ rge_schedule_tx_locked(struct rge_softc *sc)
 	}
 }
 
-/* Queue a frame for the worker to batch into the hardware ring. */
+/* Queue a frame, optionally submitting it in the caller context. */
 static int
 rge_transmit_if(if_t ifp, struct mbuf *m)
 {
@@ -1070,8 +1071,11 @@ rge_transmit_if(if_t ifp, struct mbuf *m)
 		m_freem(m);
 		return (ret);
 	}
-	/* Keep queue publication and worker scheduling under the same lock. */
-	rge_schedule_tx_locked(sc);
+	/* A pending worker owns the drain; otherwise direct mode avoids a wakeup. */
+	if (sc->sc_tx_direct && !sc->sc_tx_task_pending)
+		rge_tx_drain_locked(sc);
+	else
+		rge_schedule_tx_locked(sc);
 	sc->sc_drv_stats.transmit_queued_cnt++;
 	RGE_UNLOCK(sc);
 
@@ -2465,12 +2469,11 @@ rge_add_media_types(struct rge_softc *sc)
 }
 
 /**
- * @brief Deferred packet dequeue and submit.
+ * @brief Packet dequeue and submit with the driver lock held.
  */
 static void
-rge_tx_task(void *arg, int npending)
+rge_tx_drain_locked(struct rge_softc *sc)
 {
-	struct rge_softc *sc = (struct rge_softc *) arg;
 	/* Note: for now, one queue */
 	struct rge_queues *q = sc->sc_queues;
 	struct mbuf *m;
@@ -2479,14 +2482,10 @@ rge_tx_task(void *arg, int npending)
 
 	RGE_DPRINTF(sc, RGE_DEBUG_XMIT, "%s: running\n", __func__);
 
-	RGE_LOCK(sc);
-	/* Producers cannot enqueue until this worker finishes its locked drain. */
-	sc->sc_tx_task_pending = false;
-	sc->sc_drv_stats.tx_task_cnt++;
+	RGE_ASSERT_LOCKED(sc);
 
 	if (sc->sc_stopped == true) {
 		sc->sc_watchdog = 0;
-		RGE_UNLOCK(sc);
 		return;
 	}
 
@@ -2546,6 +2545,17 @@ rge_tx_task(void *arg, int npending)
 	    "%s: handled %d frames; prod=%d, cons=%d\n", __func__,
 	    ntx, q->q_tx.rge_txq_prodidx, q->q_tx.rge_txq_considx);
 
+}
+
+static void
+rge_tx_task(void *arg, int npending)
+{
+	struct rge_softc *sc = arg;
+
+	RGE_LOCK(sc);
+	sc->sc_tx_task_pending = false;
+	sc->sc_drv_stats.tx_task_cnt++;
+	rge_tx_drain_locked(sc);
 	RGE_UNLOCK(sc);
 }
 
