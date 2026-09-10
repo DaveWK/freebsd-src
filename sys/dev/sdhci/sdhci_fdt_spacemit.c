@@ -177,6 +177,12 @@ SYSCTL_INT(_hw_sdhci_spacemit, OID_AUTO, no_highspeed,
     "If nonzero, disable SD high-speed (force default-speed 25 MHz) for "
     "marginal cards. Default 0 = unchanged.");
 
+/* Bound cached eMMC map maintenance; zero restores maxphys sizing. */
+static int spacemit_emmc_sdma_kib = 128;
+SYSCTL_INT(_hw_sdhci_spacemit, OID_AUTO, emmc_sdma_kib,
+    CTLFLAG_RDTUN, &spacemit_emmc_sdma_kib, 0,
+    "eMMC SDMA buffer KiB: 0=maxphys, 4/8/16/32/64/128/256/512; default 128");
+
 /*
  * ROUND 34 test lever for the SDIO (WiFi) slot firmware-download write failure.
  * If nonzero, cap the SDIO base clock so post-enumeration the card runs slower
@@ -1660,6 +1666,36 @@ sdhci_fdt_spacemit_attach(device_t dev)
 		sc->quirks |= SDHCI_QUIRK_BROKEN_DMA;
 		device_printf(dev, "SDIO: forcing PIO (BROKEN_DMA) per tunable\n");
 	}
+
+	/*
+	 * Limit full-map cache maintenance for small eMMC requests without
+	 * changing synchronization, mapping attributes, ISA or clock policy.
+	 * A smaller boundary increases interrupt frequency for bulk I/O;
+	 * 128 KiB balances small-request cache cost and measured bulk throughput.
+	 * BROKEN_SDMA_BOUNDARY tells the core to retain a front-end boundary.
+	 */
+	if (((struct sdhci_fdt_spacemit_softc *)sc)->non_removable &&
+	    !((struct sdhci_fdt_spacemit_softc *)sc)->sdio_slot &&
+	    spacemit_emmc_sdma_kib != 0) {
+		switch (spacemit_emmc_sdma_kib) {
+		case 4: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_4K; break;
+		case 8: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_8K; break;
+		case 16: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_16K; break;
+		case 32: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_32K; break;
+		case 64: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_64K; break;
+		case 128: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_128K; break;
+		case 256: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_256K; break;
+		case 512: sc->sdma_boundary = SDHCI_BLKSZ_SDMA_BNDRY_512K; break;
+		default:
+			device_printf(dev, "Ignoring invalid emmc_sdma_kib=%d\n",
+			    spacemit_emmc_sdma_kib);
+			goto sdma_default;
+		}
+		sc->quirks |= SDHCI_QUIRK_BROKEN_SDMA_BOUNDARY;
+		device_printf(dev, "eMMC SDMA buffer: %d KiB\n",
+		    spacemit_emmc_sdma_kib);
+	}
+sdma_default:
 
 	error = sdhci_fdt_attach(dev);
 	if (error != 0)
