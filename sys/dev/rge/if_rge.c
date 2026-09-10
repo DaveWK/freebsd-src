@@ -1375,7 +1375,7 @@ rge_init_locked(struct rge_softc *sc)
 		RGE_MAC_CLRBIT(sc, 0xe092, 0x00ff);
 
 	/* Enable/disable HW VLAN tagging based on enabled capability */
-	if ((if_getcapabilities(sc->sc_ifp) & IFCAP_VLAN_HWTAGGING) != 0)
+	if ((if_getcapenable(sc->sc_ifp) & IFCAP_VLAN_HWTAGGING) != 0)
 		RGE_SETBIT_4(sc, RGE_RXCFG, RGE_RXCFG_VLANSTRIP);
 	else
 		RGE_CLRBIT_4(sc, RGE_RXCFG, RGE_RXCFG_VLANSTRIP);
