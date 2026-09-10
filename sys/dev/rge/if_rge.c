@@ -2342,8 +2342,8 @@ rge_txeof(struct rge_queues *q)
 		free = 1;
 	}
 
-	/* If we didn't complete any TX descriptors then return 0 */
-	if (free == 0)
+	/* Without completion progress, preserve the watchdog deadline. */
+	if (ntx == 0)
 		return (0);
 
 	if (idx >= cons) {
@@ -2375,11 +2375,9 @@ rge_txeof(struct rge_queues *q)
 	else
 		sc->sc_watchdog = 0;
 
-	/*
-	 * Kick-start the transmit task just in case we have
-	 * more frames available.
-	 */
-	taskqueue_enqueue(sc->sc_tq, &sc->sc_tx_task);
+	/* The driver lock protects the queue; only wake a worker with work. */
+	if (!mbufq_empty(&sc->sc_txq))
+		taskqueue_enqueue(sc->sc_tq, &sc->sc_tx_task);
 
 	return (1);
 }
