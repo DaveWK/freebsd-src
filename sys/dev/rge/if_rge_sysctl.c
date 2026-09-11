@@ -293,6 +293,39 @@ rge_sysctl_attach(struct rge_softc *sc)
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rss_hash", CTLFLAG_RW, &sc->sc_rss_hash, 0,
 	    "compute an RSS flow hash for received frames (applied on init)");
+
+	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "nqueues", CTLFLAG_RD, &sc->sc_nqueues, 0,
+	    "receive queues in use");
+	SYSCTL_ADD_BOOL(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "msix", CTLFLAG_RD, &sc->sc_msix, 0,
+	    "MSI-X with a vector per receive queue (v2 interrupt space)");
+	/*
+	 * Units of roughly 44 us on the RTL8125B: 3 ~ the legacy SIM timer's
+	 * 125 us cadence.  0 disables the timer (an interrupt per arrival).
+	 */
+	sc->sc_rx_miti = 3;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "rx_miti", CTLFLAG_RW, &sc->sc_rx_miti, 0,
+	    "MSI-X receive/transmit interrupt mitigation timer byte (applied on init)");
+	{
+		struct sysctl_oid *qtree;
+		char name[8];
+		unsigned int i;
+
+		for (i = 0; i < sc->sc_nqueues; i++) {
+			snprintf(name, sizeof(name), "rxq%u", i);
+			qtree = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, name, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+			    "receive queue");
+			SYSCTL_ADD_QUAD(ctx, SYSCTL_CHILDREN(qtree), OID_AUTO,
+			    "frames", CTLFLAG_RD, &sc->sc_queues[i].q_rx_frames,
+			    "frames received on this queue");
+			SYSCTL_ADD_QUAD(ctx, SYSCTL_CHILDREN(qtree), OID_AUTO,
+			    "interrupts", CTLFLAG_RD, &sc->sc_queues[i].q_rx_intr,
+			    "interrupts taken for this queue");
+		}
+	}
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_process_limit", CTLFLAG_RW, &sc->sc_rx_process_limit, 0,
 	    "max number of RX packets to process per interrupt");
