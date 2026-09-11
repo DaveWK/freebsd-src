@@ -85,6 +85,8 @@
 #include "mmcbus_if.h"
 
 #define	MMCSD_CMD_RETRIES	5
+/* Re-issues of a data transfer the host reported a timeout or CRC error on. */
+#define	MMCSD_RW_RETRIES	3
 
 #define	MMCSD_FMT_BOOT		"mmcsd%dboot"
 #define	MMCSD_FMT_GP		"mmcsd%dgp"
@@ -1158,6 +1160,42 @@ mmcsd_errmsg(int e)
 	return (errmsg[e]);
 }
 
+/*
+ * Bring the card back to the transfer state after the host abandoned a data
+ * transfer: the controller has reset its command and data paths, but the card
+ * may still be in the receive or data state.  Stop it (a card already back in
+ * tran answers with an illegal-command error, which is fine) and wait for it
+ * to leave the programming state, as the block layers of other systems do
+ * before re-issuing the transfer.
+ */
+static int
+mmcsd_recover(struct mmcsd_softc *sc)
+{
+	struct mmc_command stop;
+	device_t dev, mmcbus;
+	uint32_t status;
+	int err, retries;
+
+	dev = sc->dev;
+	mmcbus = sc->mmcbus;
+
+	memset(&stop, 0, sizeof(stop));
+	stop.opcode = MMC_STOP_TRANSMISSION;
+	stop.arg = 0;
+	stop.flags = MMC_RSP_R1B | MMC_CMD_AC;
+	(void)mmc_wait_for_cmd(mmcbus, dev, &stop, 0);
+
+	for (retries = 2000; retries > 0; retries--) {
+		err = mmc_send_status(mmcbus, dev, sc->rca, &status);
+		if (err != MMC_ERR_NONE)
+			return (err);
+		if (R1_CURRENT_STATE(status) == R1_STATE_TRAN)
+			return (MMC_ERR_NONE);
+		pause_sbt("mmcsdrc", SBT_1MS, 0, 0);
+	}
+	return (MMC_ERR_TIMEOUT);
+}
+
 static daddr_t
 mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 {
@@ -1170,10 +1208,12 @@ mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 	device_t dev, mmcbus;
 	u_int numblocks, sz;
 	char *vaddr;
+	int retries;
 
 	sc = part->sc;
 	dev = sc->dev;
 	mmcbus = sc->mmcbus;
+	retries = 0;
 
 	block = bp->bio_pblkno;
 	sz = part->disk->d_sectorsize;
@@ -1221,6 +1261,33 @@ mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 		}
 		MMCBUS_WAIT_FOR_REQUEST(mmcbus, dev, &req);
 		if (req.cmd->error != MMC_ERR_NONE) {
+			/*
+			 * A timeout or CRC error on one transfer is not the
+			 * end of the medium -- a busy card or a marginal bus
+			 * does this now and then, and with the root file
+			 * system on the card a single failed write ends in
+			 * "UFS: root fs would be forcibly unmounted".  Put the
+			 * card back into the transfer state and re-issue the
+			 * same blocks a bounded number of times first.
+			 */
+			if (retries < MMCSD_RW_RETRIES &&
+			    (req.cmd->error == MMC_ERR_TIMEOUT ||
+			    req.cmd->error == MMC_ERR_BADCRC ||
+			    req.cmd->error == MMC_ERR_FIFO)) {
+				retries++;
+				if (ppsratecheck(&sc->log_time, &sc->log_count,
+				    LOG_PPS))
+					device_printf(dev, "%s of %u block%s at "
+					    "%jd failed: %d %s; retry %d of %d\n",
+					    bp->bio_cmd == BIO_READ ? "read" :
+					    "write", numblocks,
+					    numblocks == 1 ? "" : "s",
+					    (intmax_t)block, req.cmd->error,
+					    mmcsd_errmsg(req.cmd->error),
+					    retries, MMCSD_RW_RETRIES);
+				if (mmcsd_recover(sc) == MMC_ERR_NONE)
+					continue;
+			}
 			if (ppsratecheck(&sc->log_time, &sc->log_count,
 			    LOG_PPS))
 				device_printf(dev, "Error indicated: %d %s\n",
@@ -1228,6 +1295,7 @@ mmcsd_rw(struct mmcsd_part *part, struct bio *bp)
 				    mmcsd_errmsg(req.cmd->error));
 			break;
 		}
+		retries = 0;
 		block += numblocks;
 	}
 	return (block);
