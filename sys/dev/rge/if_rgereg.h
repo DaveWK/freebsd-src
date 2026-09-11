@@ -28,6 +28,27 @@
 /* For now, a single MSI message, no multi-RX/TX ring support */
 #define	RGE_MSI_MESSAGES	1
 
+/*
+ * RTL8125B+ "v2" interrupt space, used with MSI-X: bit n of the 32-bit
+ * ISR/IMR pair is delivered on MSI-X vector n.  Receive queue q completes
+ * on vector q, the transmit queue on 16 and link change on 21, so the
+ * device wants 22 vectors even when few queues are used (Realtek r8125).
+ */
+#define RGE_MSIX_MESSAGES	22
+#define RGE_MAX_RX_QUEUES	4
+#define RGE_V2_VEC_TX		16
+#define RGE_V2_VEC_LINK		21
+#define RGE_IMR_V2_CLR		0x0d00
+#define RGE_ISR_V2		0x0d04
+#define RGE_IMR_V2_SET		0x0d0c
+#define RGE_ISR_V2_ROK(q)	(1U << (q))
+#define RGE_ISR_V2_TOK_Q0	0x00010000
+#define RGE_ISR_V2_LINKCHG	0x00200000
+#define RGE_INTMITI_V2_RX(q)	(0x0a00 + (q) * 8)	/* 8-bit timer per queue */
+#define RGE_INTMITI_V2_TX(q)	(0x0a02 + (q) * 8)
+#define RGE_RXDESC_ADDR_Q_LO(q)	(0x4000 + ((q) - 1) * 8)	/* queues >= 1 */
+#define RGE_RXDESC_ADDR_Q_HI(q)	(0x4004 + ((q) - 1) * 8)
+
 #define RGE_MAC0		0x0000
 #define RGE_MAC4		0x0004
 #define RGE_MAR0		0x0008
