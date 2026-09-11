@@ -161,6 +161,10 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_tso_err,
 	    "Number of TSO frames dropped (headers not parseable)");
 
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_rss_hashed",
+	    CTLFLAG_RD, &sc->sc_drv_stats.rx_rss_hashed,
+	    "Number of RX frames delivered with a hardware RSS flow hash");
+
 	/* RX counters */
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_ether_csum_err",
 	    CTLFLAG_RD, &sc->sc_drv_stats.rx_ether_csum_err,
@@ -280,6 +284,15 @@ rge_sysctl_attach(struct rge_softc *sc)
 	 * change, and the ring (1024 entries) has ample room.
 	 */
 	sc->sc_rx_process_limit = 64;
+
+	/*
+	 * Hardware RSS hash in the Rx descriptor, delivered as the mbuf flowid
+	 * so netisr and LRO can steer flows; takes effect at the next init.
+	 */
+	sc->sc_rss_hash = 1;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "rss_hash", CTLFLAG_RW, &sc->sc_rss_hash, 0,
+	    "compute an RSS flow hash for received frames (applied on init)");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_process_limit", CTLFLAG_RW, &sc->sc_rx_process_limit, 0,
 	    "max number of RX packets to process per interrupt");
