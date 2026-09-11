@@ -85,6 +85,8 @@ struct rge_drv_stats {
 	uint64_t		tx_offload_tcp_csum_set;
 	uint64_t		tx_offload_udp_csum_set;
 	uint64_t		tx_offload_vlan_tag_set;
+	uint64_t		tx_offload_tso_set;
+	uint64_t		tx_offload_tso_err;
 
 	uint64_t		rx_ether_csum_err;
 	uint64_t		rx_desc_jumbo_frag;

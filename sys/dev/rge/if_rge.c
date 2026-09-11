@@ -41,6 +41,9 @@
 #include <sys/kernel.h>
 
 #include <netinet/in.h>
+#include <netinet/in_systm.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <netinet/if_ether.h>
 #if defined(INET) || defined(INET6)
 #include <netinet/tcp_lro.h>
@@ -164,6 +167,18 @@ rge_attach_if(struct rge_softc *sc, const char *eaddr)
 	if_sethwassist(sc->sc_ifp, CSUM_IP | CSUM_TCP | CSUM_UDP);
 	if_setcapabilities(sc->sc_ifp, IFCAP_HWCSUM);
 	if_setcapenable(sc->sc_ifp, if_getcapabilities(sc->sc_ifp));
+
+	/*
+	 * TSO (giant send v4, as Linux r8169/r8125 program it), on by
+	 * default: validated on RTL8125 at 2.5 Gb/s line rate with exact
+	 * payload hashes and per-segment options/checksums on the wire.
+	 * Segment limits keep a full 64 KiB burst within RGE_TX_NSEGS.
+	 */
+	if_setcapabilitiesbit(sc->sc_ifp, IFCAP_TSO4, 0);
+	if_sethwassistbits(sc->sc_ifp, CSUM_IP_TSO, 0);
+	if_sethwtsomax(sc->sc_ifp, RGE_TSO_MAXSIZE);
+	if_sethwtsomaxsegcount(sc->sc_ifp, RGE_TX_NSEGS - 1);
+	if_sethwtsomaxsegsize(sc->sc_ifp, RGE_TSO_MAXSEGSIZE);
 
 	/* Enable WOL if PM is supported. */
 	if (pci_has_pm(sc->sc_dev)) {
@@ -358,7 +373,7 @@ rge_attach(device_t dev)
 	    0, /* boundary */
 	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
 	    NULL, NULL, /* filter (unused) */
-	    RGE_JUMBO_FRAMELEN, /* maxsize */
+	    RGE_TSO_MAXSIZE, /* maxsize */
 	    RGE_TX_NSEGS, /* nsegments */
 	    RGE_JUMBO_FRAMELEN, /* maxsegsize */
 	    0, /* flags */
@@ -813,6 +828,54 @@ rge_tx_list_sync(struct rge_softc *sc, struct rge_queues *q,
 	bus_dmamap_sync(sc->sc_dmat_tx_desc, q->q_tx.rge_tx_list_map, ops);
 }
 
+/*
+ * TSO: the chip segments a giant IPv4/TCP frame itself, given the TCP
+ * header offset (cmdsts, repeated in every descriptor) and the MSS (extsts),
+ * as Linux r8169/r8125 program giant send v4.  The stack has already stored
+ * the length-free pseudo-header checksum in th_sum; the hardware fills the
+ * IP and TCP checksums of each segment.  Returns non-zero (chain freed,
+ * *mp NULL) when the headers cannot be made contiguous, or when the offset
+ * or MSS does not fit the descriptor fields.
+ */
+static int
+rge_tso_setup(struct mbuf **mp, uint32_t *tsoflags, uint32_t *cflags)
+{
+	struct ether_header *eh;
+	struct ip *ip;
+	struct mbuf *m = *mp;
+	int ehlen, poff;
+
+	ehlen = ETHER_HDR_LEN;
+	if (m->m_len < ehlen + sizeof(struct ip) &&
+	    (m = m_pullup(m, ehlen + sizeof(struct ip))) == NULL)
+		goto fail;
+	eh = mtod(m, struct ether_header *);
+	if (eh->ether_type == htons(ETHERTYPE_VLAN)) {
+		ehlen += ETHER_VLAN_ENCAP_LEN;
+		if (m->m_len < ehlen + sizeof(struct ip) &&
+		    (m = m_pullup(m, ehlen + sizeof(struct ip))) == NULL)
+			goto fail;
+	}
+	ip = (struct ip *)(mtod(m, char *) + ehlen);
+	poff = ehlen + (ip->ip_hl << 2);
+	if (m->m_len < poff + sizeof(struct tcphdr) &&
+	    (m = m_pullup(m, poff + sizeof(struct tcphdr))) == NULL)
+		goto fail;
+	*mp = m;
+	if (poff > RGE_TDCMDSTS_GTTCPHO_MAX ||
+	    m->m_pkthdr.tso_segsz > RGE_TDEXTSTS_MSS_MAX) {
+		m_freem(m);
+		goto fail;
+	}
+	*tsoflags = RGE_TDCMDSTS_GTSENV4 |
+	    ((uint32_t)poff << RGE_TDCMDSTS_GTTCPHO_SHIFT);
+	*cflags |= (uint32_t)m->m_pkthdr.tso_segsz << RGE_TDEXTSTS_MSS_SHIFT;
+	return (0);
+fail:
+	*mp = NULL;
+	return (1);
+}
+
 /**
  * @brief Queue the given mbuf at the given TX slot index for transmit.
  *
@@ -840,7 +903,7 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	struct rge_txq *txq;
 	bus_dmamap_t txmap;
 	struct mbuf *m;
-	uint32_t cmdsts, cflags = 0;
+	uint32_t cmdsts, cflags = 0, tsoflags = 0;
 	int cur, error, i;
 	bus_dma_segment_t seg[RGE_TX_NSEGS];
 	int nsegs;
@@ -852,6 +915,16 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	txmap = txq->txq_dmamap;
 
 	sc->sc_drv_stats.tx_encap_cnt++;
+
+	if ((m->m_pkthdr.csum_flags & CSUM_IP_TSO) != 0) {
+		if (rge_tso_setup(mp, &tsoflags, &cflags) != 0) {
+			/* A failed pullup has already freed the chain. */
+			sc->sc_drv_stats.tx_offload_tso_err++;
+			return (-1);
+		}
+		m = *mp;
+		sc->sc_drv_stats.tx_offload_tso_set++;
+	}
 
 	nsegs = RGE_TX_NSEGS;
 	error = bus_dmamap_load_mbuf_sg(sc->sc_dmat_tx_buf, txmap, m,
@@ -883,7 +956,8 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	 * Otherwise, RGE_TDEXTSTS_TCPCSUM / RGE_TDEXTSTS_UDPCSUM does not
 	 * take affect.
 	 */
-	if ((m->m_pkthdr.csum_flags & RGE_CSUM_FEATURES) != 0) {
+	if (tsoflags == 0 &&
+	    (m->m_pkthdr.csum_flags & RGE_CSUM_FEATURES) != 0) {
 		cflags |= RGE_TDEXTSTS_IPCSUM;
 		sc->sc_drv_stats.tx_offload_ip_csum_set++;
 		if (m->m_pkthdr.csum_flags & CSUM_TCP) {
@@ -906,7 +980,7 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	for (i = 1; i < nsegs; i++) {
 		cur = RGE_NEXT_TX_DESC(cur);
 
-		cmdsts = RGE_TDCMDSTS_OWN;
+		cmdsts = RGE_TDCMDSTS_OWN | tsoflags;
 		cmdsts |= seg[i].ds_len;
 
 		if (cur == RGE_TX_LIST_CNT - 1)
@@ -932,7 +1006,7 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	txq->txq_mbuf = m;
 	txq->txq_descidx = cur;
 
-	cmdsts = RGE_TDCMDSTS_SOF;
+	cmdsts = RGE_TDCMDSTS_SOF | tsoflags;
 	cmdsts |= seg[0].ds_len;
 
 	if (idx == RGE_TX_LIST_CNT - 1)
@@ -995,6 +1069,13 @@ rge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		if (if_getmtu(ifp) != ifr->ifr_mtu)
 			if_setmtu(ifp, ifr->ifr_mtu);
 
+		/* The 11-bit MSS field cannot describe larger frames. */
+		if (if_getmtu(ifp) > RGE_TSO_MTU &&
+		    (if_getcapenable(ifp) & IFCAP_TSO4) != 0) {
+			if_setcapenablebit(ifp, 0, IFCAP_TSO4);
+			if_sethwassistbits(ifp, 0, CSUM_IP_TSO);
+		}
+
 		VLAN_CAPABILITIES(ifp);
 		break;
 
@@ -1054,6 +1135,19 @@ rge_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			    (if_getcapabilities(ifp) & IFCAP_VLAN_HWTAGGING) != 0) {
 				if_togglecapenable(ifp, IFCAP_VLAN_HWTAGGING);
 				reinit = 1;
+			}
+
+			/* TSO is per-descriptor and needs no hardware reset. */
+			if ((mask & IFCAP_TSO4) != 0 &&
+			    (if_getcapabilities(ifp) & IFCAP_TSO4) != 0) {
+				if_togglecapenable(ifp, IFCAP_TSO4);
+				if ((if_getcapenable(ifp) & IFCAP_TSO4) != 0 &&
+				    if_getmtu(ifp) <= RGE_TSO_MTU)
+					if_sethwassistbits(ifp, CSUM_IP_TSO, 0);
+				else {
+					if_setcapenablebit(ifp, 0, IFCAP_TSO4);
+					if_sethwassistbits(ifp, 0, CSUM_IP_TSO);
+				}
 			}
 
 			/* LRO is software-only and needs no hardware reset. */
