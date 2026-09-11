@@ -136,6 +136,8 @@ struct rge_rx {
 	struct mbuf		**rge_tail;
 };
 
+struct lro_ctrl;
+
 struct rge_queues {
 	struct rge_softc	*q_sc;
 	void			*q_ihc;
@@ -143,6 +145,11 @@ struct rge_queues {
 	char			q_name[16];
 	struct rge_tx		q_tx;
 	struct rge_rx		q_rx;
+	/* Receive ring state is protected by q_rx_mtx (sc_mtx -> q_rx_mtx). */
+	struct mtx		q_rx_mtx;
+	struct lro_ctrl		*q_lro;
+	uint64_t		q_rx_frames;
+	uint64_t		q_rx_intr;
 };
 
 struct rge_mac_stats {
@@ -160,10 +167,14 @@ struct rge_softc {
 	if_t			sc_ifp;		/* Ethernet common data */
 	bool			sc_ether_attached;
 	struct mtx		sc_mtx;
-	struct resource		*sc_irq[RGE_MSI_MESSAGES];
-	void			*sc_ih[RGE_MSI_MESSAGES];
+	struct resource		*sc_irq[RGE_MSIX_MESSAGES];
+	void			*sc_ih[RGE_MSIX_MESSAGES];
+	bool			sc_msix;	/* v2 interrupt space, per-queue vectors */
+	int			sc_rx_miti;	/* v2 receive mitigation timer byte */
 	uint32_t		sc_expcap;	/* PCe exp cap */
 	struct resource		*sc_bres;	/* bus space MMIO/IOPORT resource */
+	struct resource		*sc_msix_res;	/* BAR holding the MSI-X table */
+	int			sc_msix_rid;
 	bus_space_handle_t	rge_bhandle;	/* bus space handle */
 	bus_space_tag_t		rge_btag;	/* bus space tag */
 	bus_size_t		rge_bsize;
@@ -218,7 +229,6 @@ struct rge_softc {
 	struct rge_drv_stats	sc_drv_stats;
 
 	struct rge_mac_stats	sc_mac_stats;
-	struct lro_ctrl		*sc_lro;
 };
 
 /*
