@@ -192,6 +192,19 @@ exec_setregs(struct thread *td, struct image_params *imgp, uintptr_t stack)
 	tf->tf_sepc = imgp->entry_addr;
 
 	pcb->pcb_fpflags &= ~PCB_FP_STARTED;
+
+	/*
+	 * cpu_fork() handed this thread its parent's vector save area and
+	 * PCB_VS_STARTED, while the trap frame cleared above runs the new
+	 * image with VS off.  Its first vector instruction then traps, and
+	 * trap.c only enables VS for a thread it has not started -- every
+	 * other illegal instruction is SIGILL.  So with an RVV-built world,
+	 * init could run but each child it forked and exec'd died on its
+	 * first vector instruction (sh: "exited on signal 4").  Start the new
+	 * image with no vector state, exactly as the FP state above.
+	 */
+	if ((pcb->pcb_vsflags & PCB_VS_STARTED) != 0)
+		vector_state_free(td);
 }
 
 /* Sanity check these are the same size, they will be memcpy'd to and from */

@@ -31,6 +31,7 @@ void vector_state_store(struct thread *td);
 void vector_state_store_savectx(struct pcb *p);
 void vector_state_restore(struct thread *td);
 void vector_copy_thread(struct thread *td1, struct thread *td2);
+void vector_state_free(struct thread *td);
 int vector_get_size(void);
 
 #endif /* !_MACHINE_VECTOR_H_ */
