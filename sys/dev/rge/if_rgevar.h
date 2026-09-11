@@ -87,6 +87,7 @@ struct rge_drv_stats {
 	uint64_t		tx_offload_vlan_tag_set;
 	uint64_t		tx_offload_tso_set;
 	uint64_t		tx_offload_tso_err;
+	uint64_t		rx_rss_hashed;
 
 	uint64_t		rx_ether_csum_err;
 	uint64_t		rx_desc_jumbo_frag;
@@ -211,6 +212,7 @@ struct rge_softc {
 	uint32_t		sc_debug;
 
 	int			sc_rx_process_limit;
+	int			sc_rss_hash;
 	int			sc_disable_aspm;
 
 	struct rge_drv_stats	sc_drv_stats;
