@@ -1142,6 +1142,7 @@ static void
 pmap_invalidate_range_svinval(pmap_t pmap, vm_offset_t sva, vm_offset_t eva)
 {
 	struct svinval_args args;
+	cpuset_t mask;
 
 	if (CPU_EMPTY(&pmap->pm_active))
 		return;
@@ -1155,11 +1156,18 @@ pmap_invalidate_range_svinval(pmap_t pmap, vm_offset_t sva, vm_offset_t eva)
 	args.sva = sva;
 	args.eva = eva;
 	fence();
-	if (smp_started)
-		smp_rendezvous_cpus(pmap->pm_active, smp_no_rendezvous_barrier,
-		    pmap_invalidate_range_svinval_cb,
-		    smp_no_rendezvous_barrier, &args);
-	else
+	if (smp_started) {
+		/*
+		 * The last active CPU may switch away after the early check.
+		 * Validate the same snapshot passed to the rendezvous, which
+		 * requires at least one target CPU.
+		 */
+		mask = pmap->pm_active;
+		if (!CPU_EMPTY(&mask))
+			smp_rendezvous_cpus(mask, smp_no_rendezvous_barrier,
+			    pmap_invalidate_range_svinval_cb,
+			    smp_no_rendezvous_barrier, &args);
+	} else
 		pmap_invalidate_range_svinval_cb(&args);
 	sched_unpin();
 }
