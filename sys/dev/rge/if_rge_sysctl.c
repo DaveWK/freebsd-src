@@ -272,7 +272,14 @@ rge_sysctl_attach(struct rge_softc *sc)
 	    sc, 0, rge_sysctl_tx_direct, "I",
 	    "submit TX inline when no worker is pending (diagnostic)");
 
-	sc->sc_rx_process_limit = 16;
+	/*
+	 * Frames handled per interrupt.  With the simulated interrupt
+	 * moderation timer (~125 us) the batch bounds receive throughput:
+	 * 16 frames capped an MTU-1500 TCP receiver at ~1.46 Gb/s on the
+	 * 2.5 GbE RTL8125; 64 reaches line rate (2.35 Gb/s) with no other
+	 * change, and the ring (1024 entries) has ample room.
+	 */
+	sc->sc_rx_process_limit = 64;
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_process_limit", CTLFLAG_RW, &sc->sc_rx_process_limit, 0,
 	    "max number of RX packets to process per interrupt");
