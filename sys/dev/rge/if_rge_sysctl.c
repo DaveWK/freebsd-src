@@ -153,6 +153,14 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_vlan_tag_set,
 	    "Number of frames TX'ed with VLAN offload tag set");
 
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_offload_tso_set",
+	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_tso_set,
+	    "Number of TSO frames handed to the hardware");
+
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_offload_tso_err",
+	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_tso_err,
+	    "Number of TSO frames dropped (headers not parseable)");
+
 	/* RX counters */
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_ether_csum_err",
 	    CTLFLAG_RD, &sc->sc_drv_stats.rx_ether_csum_err,
