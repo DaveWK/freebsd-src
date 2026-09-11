@@ -1816,15 +1816,19 @@ rge_init_locked(struct rge_softc *sc)
 		/*
 		 * v2 interrupt space: legacy IMR/ISR stay quiet, the per-bit
 		 * set/clear registers arm the MSI-X vectors.  Receive
-		 * mitigation is the per-queue timer byte; Realtek leaves it 0
-		 * under NAPI, we keep the SIM-timer equivalent by default.
+		 * mitigation is the per-queue timer byte (the handler drains
+		 * the ring, so it only paces wake-ups).  Transmit completion
+		 * is moderated much harder: with the legacy timer it was
+		 * reclaimed at ~8 kHz, whereas an unmoderated completion
+		 * vector fires per few frames and fights the transmit path
+		 * for the driver lock.
 		 */
 		RGE_WRITE_4(sc, RGE_IMR, 0);
 		RGE_WRITE_4(sc, RGE_IMR_V2_CLR, 0xffffffff);
 		RGE_WRITE_4(sc, RGE_ISR_V2, 0xffffffff);
 		for (i = 0; i < sc->sc_nqueues; i++)
 			RGE_WRITE_1(sc, RGE_INTMITI_V2_RX(i), sc->sc_rx_miti);
-		RGE_WRITE_1(sc, RGE_INTMITI_V2_TX(0), sc->sc_rx_miti);
+		RGE_WRITE_1(sc, RGE_INTMITI_V2_TX(0), sc->sc_tx_miti);
 		RGE_SETBIT_1(sc, RGE_INT_CFG0, RGE_INT_CFG0_EN);
 		mask = RGE_ISR_V2_TOK_Q0 | RGE_ISR_V2_LINKCHG;
 		for (i = 0; i < sc->sc_nqueues; i++)
