@@ -277,6 +277,8 @@ struct sdhci_fdt_spacemit_softc {
 	struct sdhci_fdt_gpio	*gpio;	/* cd-gpios card detect */
 	struct mmc_helper	mmc_helper; /* vmmc/vqmmc + mmc-pwrseq */
 	bool			non_removable; /* DT "non-removable" */
+	bool			wp_disabled; /* DT "disable-wp" */
+	bool			wp_inverted; /* DT "wp-inverted" */
 	bool			sdio_slot; /* DT "no-mmc"+"no-sd": SDIO-only */
 
 	/*
@@ -1645,6 +1647,10 @@ sdhci_fdt_spacemit_attach(device_t dev)
 	}
 	((struct sdhci_fdt_spacemit_softc *)sc)->non_removable =
 	    OF_hasprop(ofw_bus_get_node(dev), "non-removable");
+	((struct sdhci_fdt_spacemit_softc *)sc)->wp_disabled =
+	    OF_hasprop(ofw_bus_get_node(dev), "disable-wp");
+	((struct sdhci_fdt_spacemit_softc *)sc)->wp_inverted =
+	    OF_hasprop(ofw_bus_get_node(dev), "wp-inverted");
 	/*
 	 * SDIO-only slot (neither SD memory nor eMMC allowed by the DT):
 	 * needs the forced pad-clock + 1.8V signaling in phy_setup.  Must be
@@ -1837,17 +1843,21 @@ sdma_default:
  * The eMMC is soldered down (DT "non-removable") and has no write-protect
  * line; the SDHCI WRITE_PROTECT present-state bit is meaningless for it and
  * reads as protected, which forces the root fs read-only and panics
- * ("UFS: root fs would be forcibly unmounted").  Report a non-removable
- * slot writable; fall back to the generic WP read for a removable (SD) slot.
+ * ("UFS: root fs would be forcibly unmounted").  A microSD slot has no
+ * write-protect line either -- the RV2's boot card came up "(read-only)" the
+ * same way and panicked in the rc "mount -u" -- and its DT says so with
+ * "disable-wp".  Report a non-removable or write-protect-less slot writable
+ * and fall back to the present-state bit, honouring "wp-inverted", only for
+ * a slot that describes neither.
  */
 static int
 sdhci_fdt_spacemit_get_ro(device_t brdev, device_t reqdev)
 {
 	struct sdhci_fdt_spacemit_softc *sc = device_get_softc(brdev);
 
-	if (sc->non_removable)
+	if (sc->non_removable || sc->wp_disabled)
 		return (0);
-	return (sdhci_generic_get_ro(brdev, reqdev));
+	return (sdhci_generic_get_ro(brdev, reqdev) ^ sc->wp_inverted);
 }
 
 /*
