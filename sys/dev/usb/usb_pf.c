@@ -240,6 +240,14 @@ usbpf_xfertap(struct usb_xfer *xfer, int type)
 
 	bus = xfer->xroot->bus;
 
+	/*
+	 * Without a listener there is nothing to deliver; skip the
+	 * per-transfer allocation and payload copy.  This check was lost
+	 * when the usbus ifnet went away (1615eff94cda).
+	 */
+	if (bus->bpf == NULL || !bpf_peers_present(bus->bpf))
+		return;
+
 	totlen = usbpf_xfer_precompute_size(xfer, type);
 
 	if (type == USBPF_XFERTAP_SUBMIT)
