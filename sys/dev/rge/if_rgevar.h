@@ -163,6 +163,7 @@ struct rge_queues {
 	struct task		q_tx_task;
 	bool			q_tx_task_pending;	/* q_tx_mtx */
 	bool			q_tx_active;		/* has a TX ring + hw queue */
+	bus_dmamap_t		*q_tx_spare;		/* per-CPU spare maps (mp_ncpus) */
 	uint64_t		q_tx_frames;
 	uint64_t		q_tx_intr;
 };
