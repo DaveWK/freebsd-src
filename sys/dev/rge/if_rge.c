@@ -95,7 +95,6 @@ SYSCTL_INT(_hw_rge, OID_AUTO, nqueues, CTLFLAG_RDTUN, &rge_nqueues, 0,
 static int rge_msix = 1;
 SYSCTL_INT(_hw_rge, OID_AUTO, msix, CTLFLAG_RDTUN, &rge_msix, 0,
     "use MSI-X with a vector per receive queue when nqueues > 1");
-static int rge_next_cpu;
 
 static int		rge_attach(device_t);
 static int		rge_detach(device_t);
@@ -452,8 +451,17 @@ rge_attach(device_t dev)
 			}
 			bus_describe_intr(dev, sc->sc_irq[i], sc->sc_ih[i],
 			    "rx%d", i);
-			bus_bind_intr(dev, sc->sc_irq[i],
-			    rge_next_cpu++ % mp_ncpus);
+			/*
+			 * Queue q on CPU q, per port.  The RSS indirection
+			 * table maps a flow to queue (hash % nqueues) and
+			 * netisr picks the worker on CPU (hash % nthreads), so
+			 * with as many queues as bound netisr threads a
+			 * frame's receive interrupt and its forwarding thread
+			 * share a core: the deferred handoff stays local
+			 * instead of waking another CPU.  A global round-robin
+			 * across ports put rge1's queues on other cores.
+			 */
+			bus_bind_intr(dev, sc->sc_irq[i], i % mp_ncpus);
 		}
 		/* Transmit completion vector(s): one per TX queue. */
 		for (i = 0; i < sc->sc_ntxq; i++) {
