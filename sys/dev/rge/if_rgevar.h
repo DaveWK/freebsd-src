@@ -171,6 +171,7 @@ struct rge_softc {
 	void			*sc_ih[RGE_MSIX_MESSAGES];
 	bool			sc_msix;	/* v2 interrupt space, per-queue vectors */
 	int			sc_rx_miti;	/* v2 receive mitigation timer byte */
+	int			sc_tx_miti;	/* v2 transmit completion timer byte */
 	uint32_t		sc_expcap;	/* PCe exp cap */
 	struct resource		*sc_bres;	/* bus space MMIO/IOPORT resource */
 	struct resource		*sc_msix_res;	/* BAR holding the MSI-X table */
