@@ -35,7 +35,7 @@
  * device wants 22 vectors even when few queues are used (Realtek r8125).
  */
 #define RGE_MSIX_MESSAGES	22
-#define RGE_MAX_RX_QUEUES	4
+#define RGE_MAX_RX_QUEUES	8	/* 8125B hardware limit (r8125 HwSuppNumRxQueues) */
 #define RGE_MAX_TX_QUEUES	2	/* 8125B hardware limit (r8125 CFG_METHOD_5) */
 #define RGE_V2_VEC_TX		16	/* TX queue 0 completion (ISR bit 16) */
 #define RGE_V2_VEC_TX_Q1	18	/* TX queue 1 completion (ISR bit 18) */
