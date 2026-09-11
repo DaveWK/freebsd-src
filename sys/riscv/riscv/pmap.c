@@ -237,6 +237,17 @@ SYSCTL_INT(_vm_pmap, OID_AUTO, mode, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
     &pmap_mode, 0,
     "translation mode, 0 = SV39, 1 = SV48");
 
+/*
+ * Boot-time control for the Svinval TLB invalidation path.  When the CPU
+ * advertises Svinval the kernel invalidates remote TLBs with a rendezvous
+ * of sinval.vma; setting vm.pmap.svinval=0 in the loader keeps the SBI
+ * remote-fence path instead.  Read before ifunc resolution, so NOFETCH.
+ */
+static int pmap_svinval_enabled = 1;
+SYSCTL_INT(_vm_pmap, OID_AUTO, svinval, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
+    &pmap_svinval_enabled, 0,
+    "use Svinval rendezvous for TLB invalidation (0 = SBI remote fence)");
+
 struct pmap kernel_pmap_store;
 
 vm_offset_t virtual_avail;	/* VA of first avail page (after kernel bss) */
@@ -1178,10 +1189,18 @@ pmap_invalidate_page_svinval(pmap_t pmap, vm_offset_t va)
 	pmap_invalidate_range_svinval(pmap, va, va + PAGE_SIZE);
 }
 
+static bool
+pmap_use_svinval(void)
+{
+
+	TUNABLE_INT_FETCH("vm.pmap.svinval", &pmap_svinval_enabled);
+	return (has_svinval && pmap_svinval_enabled != 0);
+}
+
 DEFINE_IFUNC(, void, pmap_invalidate_range,
     (pmap_t pmap, vm_offset_t sva, vm_offset_t eva))
 {
-	if (has_svinval)
+	if (pmap_use_svinval())
 		return (pmap_invalidate_range_svinval);
 	return (pmap_invalidate_range_sbi);
 }
@@ -1189,7 +1208,7 @@ DEFINE_IFUNC(, void, pmap_invalidate_range,
 DEFINE_IFUNC(, void, pmap_invalidate_page,
     (pmap_t pmap, vm_offset_t va))
 {
-	if (has_svinval)
+	if (pmap_use_svinval())
 		return (pmap_invalidate_page_svinval);
 	return (pmap_invalidate_page_sbi);
 }
