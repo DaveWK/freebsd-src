@@ -81,7 +81,30 @@
 #define RGE_ADDR0		0x19e0
 #define RGE_ADDR1		0x19e4
 #define RGE_RSS_CTRL		0x4500
+#define RGE_RSS_KEY		0x4600	/* 40 bytes */
+#define RGE_RSS_INDIR_TBL	0x4700	/* 128 one-byte entries */
 #define RGE_RXQUEUE_CTRL	0x4800
+
+/* Flags for register RGE_RSS_CTRL (Realtek r8125 _rtl8125_set_rss_hash_opt) */
+#define RGE_RSS_CTRL_TCP_IPV4		0x00000001
+#define RGE_RSS_CTRL_IPV4		0x00000002
+#define RGE_RSS_CTRL_TCP_IPV6		0x00000004
+#define RGE_RSS_CTRL_IPV6		0x00000008
+#define RGE_RSS_CTRL_IPV6_EXT		0x00000010
+#define RGE_RSS_CTRL_TCP_IPV6_EXT	0x00000020
+#define RGE_RSS_CTRL_HASH_MASK_SHIFT	8	/* log2(indirection entries) */
+#define RGE_RSS_CTRL_UDP_IPV4		0x00000800
+#define RGE_RSS_CTRL_UDP_IPV6		0x00001000
+#define RGE_RSS_CTRL_UDP_IPV6_EXT	0x00002000
+#define RGE_RSS_CTRL_CPU_NUM_SHIFT	16	/* log2(rx queues) */
+#define RGE_RSS_INDIR_ENTRIES		128
+#define RGE_RSS_KEY_LEN			40
+
+/* RSS type in the v3 Rx descriptor hdr_info (RTL8125B) */
+#define RGE_RXHDR_RSS_UDP	0x0200
+#define RGE_RXHDR_RSS_IPV4	0x0400
+#define RGE_RXHDR_RSS_IPV6	0x1000
+#define RGE_RXHDR_RSS_TCP	0x2000
 #define RGE_EEE_TXIDLE_TIMER	0x6048
 
 /* Flags for register RGE_INT_CFG0 */

@@ -58,6 +58,7 @@
 #include <net/if_media.h>
 #include <net/if_types.h>
 #include <net/if_vlan_var.h>
+#include <net/rss_config.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -1250,6 +1251,38 @@ rge_init_if(void *xsc)
 	RGE_UNLOCK(sc);
 }
 
+/*
+ * Program the RSS hash engine.  With a single receive queue every entry of
+ * the indirection table is queue 0, so this only makes the chip write a
+ * Toeplitz hash and its type into each v3 Rx descriptor (the stack's RSS
+ * key, so the value matches software hashing).  Multi-queue steering would
+ * add the queue count and a real table here.
+ */
+static void
+rge_setup_rss(struct rge_softc *sc)
+{
+	uint8_t key[RSS_KEYSIZE];
+	uint32_t ctrl;
+	int i;
+
+	if (!sc->sc_rss_hash) {
+		RGE_WRITE_4(sc, RGE_RSS_CTRL, 0);
+		return;
+	}
+	rss_getkey(key);
+	for (i = 0; i < RGE_RSS_KEY_LEN; i += 4)
+		RGE_WRITE_4(sc, RGE_RSS_KEY + i, le32dec(key + i));
+	for (i = 0; i < RGE_RSS_INDIR_ENTRIES; i += 4)
+		RGE_WRITE_4(sc, RGE_RSS_INDIR_TBL + i, 0);
+	ctrl = RGE_RSS_CTRL_TCP_IPV4 | RGE_RSS_CTRL_IPV4 | RGE_RSS_CTRL_IPV6 |
+	    RGE_RSS_CTRL_IPV6_EXT | RGE_RSS_CTRL_TCP_IPV6 |
+	    RGE_RSS_CTRL_TCP_IPV6_EXT | RGE_RSS_CTRL_UDP_IPV4 |
+	    RGE_RSS_CTRL_UDP_IPV6 | RGE_RSS_CTRL_UDP_IPV6_EXT |
+	    (7 << RGE_RSS_CTRL_HASH_MASK_SHIFT) |
+	    ((fls(sc->sc_nqueues) - 1) << RGE_RSS_CTRL_CPU_NUM_SHIFT);
+	RGE_WRITE_4(sc, RGE_RSS_CTRL, ctrl);
+}
+
 static void
 rge_init_locked(struct rge_softc *sc)
 {
@@ -1333,7 +1366,7 @@ rge_init_locked(struct rge_softc *sc)
 	} else if (!RGE_TYPE_R25D(sc))
 		RGE_WRITE_2(sc, 0x0382, 0x221b);
 
-	RGE_WRITE_1(sc, RGE_RSS_CTRL, 0);
+	rge_setup_rss(sc);
 
 	val = RGE_READ_2(sc, RGE_RXQUEUE_CTRL) & ~0x001c;
 	RGE_WRITE_2(sc, RGE_RXQUEUE_CTRL, val | (fls(sc->sc_nqueues) - 1) << 2);
@@ -2424,6 +2457,35 @@ rge_rxeof(struct rge_queues *q, struct mbufq *mq)
 			m->m_pkthdr.ether_vtag =
 			    ntohs(extsts & RGE_RDEXTSTS_VLAN_MASK);
 			m->m_flags |= M_VLANTAG;
+		}
+
+		/*
+		 * Hardware RSS hash and type (v3 descriptor).  Only trusted
+		 * from a frame that fits one descriptor; the hash belongs to
+		 * the descriptor carrying the headers.
+		 */
+		if ((rxstat & (RGE_RDCMDSTS_SOF | RGE_RDCMDSTS_EOF)) ==
+		    (RGE_RDCMDSTS_SOF | RGE_RDCMDSTS_EOF)) {
+			uint16_t hdr;
+
+			hdr = le16toh(cur_rx->lo_qword1.rx_qword1.hdr_info);
+			if (hdr & (RGE_RXHDR_RSS_IPV4 | RGE_RXHDR_RSS_IPV6)) {
+				m->m_pkthdr.flowid =
+				    le32toh(cur_rx->lo_qword1.rx_qword1.rss);
+				if (hdr & RGE_RXHDR_RSS_TCP)
+					M_HASHTYPE_SET(m, (hdr & RGE_RXHDR_RSS_IPV4) ?
+					    M_HASHTYPE_RSS_TCP_IPV4 :
+					    M_HASHTYPE_RSS_TCP_IPV6);
+				else if (hdr & RGE_RXHDR_RSS_UDP)
+					M_HASHTYPE_SET(m, (hdr & RGE_RXHDR_RSS_IPV4) ?
+					    M_HASHTYPE_RSS_UDP_IPV4 :
+					    M_HASHTYPE_RSS_UDP_IPV6);
+				else
+					M_HASHTYPE_SET(m, (hdr & RGE_RXHDR_RSS_IPV4) ?
+					    M_HASHTYPE_RSS_IPV4 :
+					    M_HASHTYPE_RSS_IPV6);
+				sc->sc_drv_stats.rx_rss_hashed++;
+			}
 		}
 
 		mbufq_enqueue(mq, m);
