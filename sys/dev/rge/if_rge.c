@@ -1205,24 +1205,23 @@ fail:
  *		returned; if the mbuf couldn't be mapped and the caller should
  *		free it then -1 is returned.
  */
+/*
+ * First half of encapsulation: everything that does not touch the ring.
+ * Prepare the chain (TSO pullup, defrag), load it into MAP, sync the data for
+ * the device and compute the descriptor flags.  Needs no lock, so the busdma
+ * work -- bounce/copy and cache maintenance, most of the per-frame transmit
+ * cost -- can run outside q_tx_mtx.  Returns the segment count, or -1 on
+ * failure (a failed TSO pullup has already freed the chain and *mp is NULL).
+ */
 static int
-rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
-    int idx)
+rge_encap_load(struct rge_softc *sc, struct mbuf **mp, bus_dmamap_t txmap,
+    bus_dma_segment_t *seg, uint32_t *cflagsp, uint32_t *tsoflagsp)
 {
-	struct rge_tx_desc *d = NULL;
-	struct rge_txq *txq;
-	bus_dmamap_t txmap;
+	uint32_t cflags = 0, tsoflags = 0;
 	struct mbuf *m;
-	uint32_t cmdsts, cflags = 0, tsoflags = 0;
-	int cur, error, i;
-	bus_dma_segment_t seg[RGE_TX_NSEGS];
-	int nsegs;
-
-	mtx_assert(&q->q_tx_mtx, MA_OWNED);
+	int error, nsegs;
 
 	m = *mp;
-	txq = &q->q_tx.rge_txq[idx];
-	txmap = txq->txq_dmamap;
 
 	sc->sc_drv_stats.tx_encap_cnt++;
 
@@ -1284,6 +1283,35 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	if (m->m_flags & M_VLANTAG) {
 		sc->sc_drv_stats.tx_offload_vlan_tag_set++;
 		cflags |= htons(m->m_pkthdr.ether_vtag) | RGE_TDEXTSTS_VTAG;
+	}
+
+	*cflagsp = cflags;
+	*tsoflagsp = tsoflags;
+	return (nsegs);
+}
+
+/*
+ * Second half: write the descriptors for an already loaded chain into the
+ * ring at IDX and hand them to the chip.  TXMAP becomes the slot's map; when
+ * OLDP is given the slot's previous (unloaded) map is returned through it so
+ * the caller can keep it as a spare.  Called with q_tx_mtx held.
+ */
+static int
+rge_encap_fill(struct rge_softc *sc, struct rge_queues *q, int idx,
+    struct mbuf *m, bus_dmamap_t txmap, bus_dma_segment_t *seg, int nsegs,
+    uint32_t cflags, uint32_t tsoflags, bus_dmamap_t *oldp)
+{
+	struct rge_tx_desc *d = NULL;
+	struct rge_txq *txq;
+	uint32_t cmdsts;
+	int cur, i;
+
+	mtx_assert(&q->q_tx_mtx, MA_OWNED);
+
+	txq = &q->q_tx.rge_txq[idx];
+	if (oldp != NULL) {
+		*oldp = txq->txq_dmamap;
+		txq->txq_dmamap = txmap;
 	}
 
 	cur = idx;
@@ -1360,6 +1388,25 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
 	wmb();
 
 	return (nsegs);
+}
+
+/* Load and fill in one step, into the slot's own map: the queued path. */
+static int
+rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp, int idx)
+{
+	bus_dma_segment_t seg[RGE_TX_NSEGS];
+	bus_dmamap_t txmap;
+	uint32_t cflags = 0, tsoflags = 0;
+	int nsegs;
+
+	mtx_assert(&q->q_tx_mtx, MA_OWNED);
+
+	txmap = q->q_tx.rge_txq[idx].txq_dmamap;
+	nsegs = rge_encap_load(sc, mp, txmap, seg, &cflags, &tsoflags);
+	if (nsegs <= 0)
+		return (nsegs);
+	return (rge_encap_fill(sc, q, idx, *mp, txmap, seg, nsegs, cflags,
+	    tsoflags, NULL));
 }
 
 static int
@@ -1544,6 +1591,87 @@ rge_transmit_if(if_t ifp, struct mbuf *m)
 	int ret;
 
 	q = rge_select_txq(sc, m);
+
+	/*
+	 * Direct-submission fast path: load the frame before taking the
+	 * lock.  The busdma map load (bounce/copy plus cache maintenance)
+	 * is most of the per-frame transmit cost, and under q_tx_mtx it was
+	 * what the forwarding threads queued up behind; done here the lock
+	 * covers only the descriptor writes and the doorbell.  Ordering is
+	 * kept because one flow's frames come from one thread, and a
+	 * non-empty software queue means the ring backed up, in which case
+	 * this frame goes to the back of that queue like any other.
+	 */
+	if (sc->sc_tx_direct && mbufq_len(&q->q_txq) == 0) {
+		bus_dma_segment_t seg[RGE_TX_NSEGS];
+		bus_dmamap_t map, old;
+		uint32_t cflags = 0, tsoflags = 0;
+		int cpu, nsegs, idx, free;
+
+		critical_enter();
+		cpu = curcpu;
+		map = q->q_tx_spare[cpu];
+		q->q_tx_spare[cpu] = NULL;
+		critical_exit();
+		if (map != NULL) {
+			nsegs = rge_encap_load(sc, &m, map, seg, &cflags,
+			    &tsoflags);
+			if (nsegs < 0) {
+				/* Load failed; the queued path would drop too. */
+				sc->sc_drv_stats.transmit_call_cnt++;
+				if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
+				m_freem(m);
+				critical_enter();
+				q->q_tx_spare[cpu] = map;
+				critical_exit();
+				return (0);
+			}
+			mtx_lock(&q->q_tx_mtx);
+			sc->sc_drv_stats.transmit_call_cnt++;
+			if (sc->sc_stopped == true) {
+				sc->sc_drv_stats.transmit_stopped_cnt++;
+				mtx_unlock(&q->q_tx_mtx);
+				bus_dmamap_unload(sc->sc_dmat_tx_buf, map);
+				critical_enter();
+				q->q_tx_spare[cpu] = map;
+				critical_exit();
+				m_freem(m);
+				return (ENETDOWN);
+			}
+			idx = q->q_tx.rge_txq_prodidx;
+			free = q->q_tx.rge_txq_considx;
+			if (free <= idx)
+				free += RGE_TX_LIST_CNT;
+			free -= idx;
+			if (mbufq_len(&q->q_txq) == 0 &&
+			    free >= RGE_TX_NSEGS + 2) {
+				rge_encap_fill(sc, q, idx, m, map, seg, nsegs,
+				    cflags, tsoflags, &old);
+				ETHER_BPF_MTAP(ifp, m);
+				idx += nsegs;
+				if (idx >= RGE_TX_LIST_CNT)
+					idx -= RGE_TX_LIST_CNT;
+				q->q_tx.rge_txq_prodidx = idx;
+				q->q_tx_frames++;
+				sc->sc_watchdog = 5;
+				RGE_WRITE_2(sc, RGE_TXSTART,
+				    RGE_TXSTART_Q(q->q_index));
+				sc->sc_drv_stats.transmit_queued_cnt++;
+				mtx_unlock(&q->q_tx_mtx);
+				critical_enter();
+				q->q_tx_spare[cpu] = old;
+				critical_exit();
+				return (0);
+			}
+			/* No room, or the queue filled meanwhile: queue it. */
+			mtx_unlock(&q->q_tx_mtx);
+			bus_dmamap_unload(sc->sc_dmat_tx_buf, map);
+			critical_enter();
+			q->q_tx_spare[cpu] = map;
+			critical_exit();
+			sc->sc_drv_stats.transmit_call_cnt--; /* counted below */
+		}
+	}
 
 	mtx_lock(&q->q_tx_mtx);
 	sc->sc_drv_stats.transmit_call_cnt++;
@@ -2227,6 +2355,22 @@ rge_allocmem(struct rge_softc *sc)
 			goto error;
 		}
 	}
+	/*
+	 * One spare map per CPU: the direct-submission fast path loads a
+	 * frame into its CPU's spare before taking q_tx_mtx and then swaps
+	 * the spare into the ring slot under the lock.
+	 */
+	q->q_tx_spare = malloc(sizeof(bus_dmamap_t) * mp_ncpus, M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+	for (i = 0; i < mp_ncpus; i++) {
+		error = bus_dmamap_create(sc->sc_dmat_tx_buf, 0,
+		    &q->q_tx_spare[i]);
+		if (error) {
+			RGE_PRINT_ERROR(sc,
+			    "can't create spare DMA map for TX (%d)\n", error);
+			goto error;
+		}
+	}
 	}	/* per-TX-queue loop */
 
 	for (nq = 0; nq < sc->sc_nqueues; nq++) {
@@ -2387,6 +2531,14 @@ rge_freemem(struct rge_softc *sc)
 		    q->q_tx.rge_tx_list_map);
 	}
 	memset(&q->q_tx, 0, sizeof(q->q_tx));
+	if (q->q_tx_spare != NULL) {
+		for (i = 0; i < mp_ncpus; i++)
+			if (q->q_tx_spare[i] != NULL)
+				bus_dmamap_destroy(sc->sc_dmat_tx_buf,
+				    q->q_tx_spare[i]);
+		free(q->q_tx_spare, M_DEVBUF);
+		q->q_tx_spare = NULL;
+	}
 	}	/* per-TX-queue loop */
 
 	for (nq = 0; nq < sc->sc_nqueues; nq++) {
