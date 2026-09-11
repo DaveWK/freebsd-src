@@ -150,6 +150,21 @@ struct rge_queues {
 	struct lro_ctrl		*q_lro;
 	uint64_t		q_rx_frames;
 	uint64_t		q_rx_intr;
+	/*
+	 * Transmit ring state is protected by q_tx_mtx, a leaf lock taken
+	 * without sc_mtx on the fast path so that forwarding threads landing
+	 * on different TX queues do not serialise (one TX queue was the
+	 * router-aggregate ceiling).  init/stop quiesce TX by taking every
+	 * q_tx_mtx under sc_mtx.
+	 */
+	struct mtx		q_tx_mtx;
+	char			q_tx_name[16];
+	struct mbufq		q_txq;
+	struct task		q_tx_task;
+	bool			q_tx_task_pending;	/* q_tx_mtx */
+	bool			q_tx_active;		/* has a TX ring + hw queue */
+	uint64_t		q_tx_frames;
+	uint64_t		q_tx_intr;
 };
 
 struct rge_mac_stats {
@@ -190,20 +205,18 @@ struct rge_softc {
 	enum rge_mac_type	rge_type;
 
 	struct rge_queues	*sc_queues;
-	unsigned int		sc_nqueues;
+	unsigned int		sc_nqueues;	/* receive queues (RSS) */
+	unsigned int		sc_ntxq;	/* transmit queues (1 or 2) */
 
 	bool			sc_detaching;
 	bool			sc_stopped;
 	bool			sc_suspended;
 
-	/* Note: these likely should be per-TXQ */
-	struct mbufq		sc_txq;
+	/* Shared taskqueue for the per-TXQ drain tasks (q_tx_task). */
 	struct taskqueue *	sc_tq;
 	char			sc_tq_name[32];
 	char			sc_tq_thr_name[32];
-	struct task		sc_tx_task;
-	bool			sc_tx_task_pending; /* protected by RGE_LOCK */
-	int			sc_tx_direct; /* protected by RGE_LOCK */
+	int			sc_tx_direct;	/* read-mostly; drain in caller ctx */
 
 	struct callout		sc_timeout;	/* 1 second tick */
 

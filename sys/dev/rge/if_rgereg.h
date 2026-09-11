@@ -36,13 +36,19 @@
  */
 #define RGE_MSIX_MESSAGES	22
 #define RGE_MAX_RX_QUEUES	4
-#define RGE_V2_VEC_TX		16
+#define RGE_MAX_TX_QUEUES	2	/* 8125B hardware limit (r8125 CFG_METHOD_5) */
+#define RGE_V2_VEC_TX		16	/* TX queue 0 completion (ISR bit 16) */
+#define RGE_V2_VEC_TX_Q1	18	/* TX queue 1 completion (ISR bit 18) */
 #define RGE_V2_VEC_LINK		21
+/* TX completion vector for queue q: q0 -> 16, q1 -> 18. */
+#define RGE_V2_VEC_TX_Q(q)	((q) == 0 ? RGE_V2_VEC_TX : RGE_V2_VEC_TX_Q1)
 #define RGE_IMR_V2_CLR		0x0d00
 #define RGE_ISR_V2		0x0d04
 #define RGE_IMR_V2_SET		0x0d0c
 #define RGE_ISR_V2_ROK(q)	(1U << (q))
-#define RGE_ISR_V2_TOK_Q0	0x00010000
+#define RGE_ISR_V2_TOK_Q0	0x00010000	/* ISR bit 16 */
+#define RGE_ISR_V2_TOK_Q1	0x00040000	/* ISR bit 18 */
+#define RGE_ISR_V2_TOK(q)	((q) == 0 ? RGE_ISR_V2_TOK_Q0 : RGE_ISR_V2_TOK_Q1)
 #define RGE_ISR_V2_LINKCHG	0x00200000
 #define RGE_INTMITI_V2_RX(q)	(0x0a00 + (q) * 8)	/* 8-bit timer per queue */
 #define RGE_INTMITI_V2_TX(q)	(0x0a02 + (q) * 8)
@@ -58,6 +64,9 @@
 #define	RGE_DTCCR_HI		0x0014
 #define RGE_TXDESC_ADDR_LO	0x0020
 #define RGE_TXDESC_ADDR_HI	0x0024
+/* TX queue 1 descriptor ring base (r8125 TNPDS_Q1_LOW_8125 + (q-1)*8). */
+#define RGE_TXDESC_ADDR_Q_LO(q)	(0x2100 + ((q) - 1) * 8)	/* queues >= 1 */
+#define RGE_TXDESC_ADDR_Q_HI(q)	(0x2104 + ((q) - 1) * 8)
 #define RGE_INT_CFG0		0x0034
 #define RGE_CMD			0x0037
 #define RGE_IMR			0x0038
@@ -223,8 +232,9 @@
 #define RGE_EPHYAR_ADDR_MASK	0x0000007f
 #define RGE_EPHYAR_ADDR_SHIFT	16
 
-/* Flags for register RGE_TXSTART */
-#define RGE_TXSTART_START	0x0001
+/* Flags for register RGE_TXSTART (TPPOLL): one polling bit per TX queue. */
+#define RGE_TXSTART_START	0x0001		/* == RGE_TXSTART_Q(0) */
+#define RGE_TXSTART_Q(q)	(1U << (q))
 
 /* Flags for register RGE_MACOCP */
 #define RGE_MACOCP_DATA_MASK	0x0000ffff
