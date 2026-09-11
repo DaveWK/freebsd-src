@@ -219,6 +219,24 @@ vector_copy_thread(struct thread *td1, struct thread *td2)
 	memcpy(p2->pcb_vsaved, p1->pcb_vsaved, len);
 }
 
+/*
+ * Drop a thread's vector save area together with PCB_VS_STARTED.  The flag
+ * and the buffer are one invariant: cpu_fork() tests only the flag before
+ * calling vector_state_store(), which asserts the buffer is non-NULL, and
+ * trap.c re-runs vector_state_init(), which asserts pcb_vsaved == NULL, on
+ * the next vector instruction of a thread whose flag is clear.
+ */
+void
+vector_state_free(struct thread *td)
+{
+	struct pcb *pcb;
+
+	pcb = td->td_pcb;
+	free(pcb->pcb_vsaved, M_RVV_CTX);
+	pcb->pcb_vsaved = NULL;
+	pcb->pcb_vsflags &= ~PCB_VS_STARTED;
+}
+
 static void
 vector_thread_dtor(void *arg __unused, struct thread *td)
 {
@@ -234,26 +252,16 @@ vector_thread_dtor(void *arg __unused, struct thread *td)
 	 *
 	 * malloc-1024 is the save area itself: VLEN=256 * 32 registers.
 	 * Observed on a SpacemiT K1 running userland built with RVV enabled.
-	 * free(NULL) is a no-op, so the NULL case needs no test.
-	 */
-	free(td->td_pcb->pcb_vsaved, M_RVV_CTX);
-	td->td_pcb->pcb_vsaved = NULL;
-
-	/*
-	 * PCB_VS_STARTED has to go with it.  The flag and the buffer are one
-	 * invariant: cpu_fork() tests only the flag before calling
-	 * vector_state_store(), which asserts the buffer is non-NULL.
-	 * Clearing the pointer while leaving the flag set hands a recycled
+	 * Leaving the flag set while clearing the pointer hands a recycled
 	 * thread a context it no longer owns:
 	 *
 	 *   panic: VS area is NULL
 	 *
 	 * Observed on a SpacemiT K1 building packages, in a fork off a
-	 * recycled thread.  Leaving both clear is also what trap.c expects:
-	 * the first vector instruction re-runs vector_state_init(), which
-	 * asserts pcb_vsaved == NULL.
+	 * recycled thread.  free(NULL) is a no-op, so the NULL case needs no
+	 * test.
 	 */
-	td->td_pcb->pcb_vsflags &= ~PCB_VS_STARTED;
+	vector_state_free(td);
 }
 
 static void
