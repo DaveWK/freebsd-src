@@ -307,7 +307,12 @@ rge_sysctl_attach(struct rge_softc *sc)
 	sc->sc_rx_miti = 3;
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_miti", CTLFLAG_RW, &sc->sc_rx_miti, 0,
-	    "MSI-X receive/transmit interrupt mitigation timer byte (applied on init)");
+	    "MSI-X receive interrupt mitigation timer byte (applied on init)");
+	/* Realtek's timer_count_v2 (0x2600 / 0x100): ~1.7 ms, a 1024-entry ring absorbs it. */
+	sc->sc_tx_miti = 0x26;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "tx_miti", CTLFLAG_RW, &sc->sc_tx_miti, 0,
+	    "MSI-X transmit completion mitigation timer byte (applied on init)");
 	{
 		struct sysctl_oid *qtree;
 		char name[8];
