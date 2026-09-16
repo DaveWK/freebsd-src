@@ -99,6 +99,14 @@
 #define	SDHCI_QUIRK_SLOTTYPE_BROKEN			(1U << 31)
 
 /*
+ * Second quirk word.  The first is full (bits 0-31 all assigned), and these
+ * are opt-ins rather than workarounds: a front-end sets them for hardware it
+ * has validated.
+ */
+/* Use ADMA2 rather than SDMA-through-a-bounce-buffer for data transfers. */
+#define	SDHCI_QUIRK2_USE_ADMA2			(1 << 0)
+
+/*
  * Controller registers
  */
 #define	SDHCI_DMA_ADDRESS	0x00
@@ -242,6 +250,7 @@
 #define	 SDHCI_INT_CMD_MASK	(SDHCI_INT_RESPONSE | SDHCI_INT_CMD_ERROR_MASK)
 
 #define	 SDHCI_INT_DATA_MASK	(SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | \
+    SDHCI_INT_ADMAERR | \
 		SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL | \
 		SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC | \
 		SDHCI_INT_DATA_END_BIT)
@@ -348,9 +357,22 @@ SYSCTL_DECL(_hw_sdhci);
 extern u_int sdhci_quirk_clear;
 extern u_int sdhci_quirk_set;
 
+/* ADMA2 descriptor, 32-bit addressing (SD Host Controller spec 1.13.3). */
+struct sdhci_adma2_desc32 {
+	uint16_t	attr;
+	uint16_t	len;
+	uint32_t	addr;
+} __packed;
+#define	SDHCI_ADMA2_ATTR_VALID	0x0001
+#define	SDHCI_ADMA2_ATTR_END	0x0002
+#define	SDHCI_ADMA2_ATTR_INT	0x0004
+#define	SDHCI_ADMA2_ATTR_TRAN	0x0020	/* action: transfer data */
+#define	SDHCI_ADMA2_MAX_SEGLEN	65532	/* 16-bit length; keep a 4-byte multiple */
+
 struct sdhci_slot {
 	struct mtx	mtx;		/* Slot mutex */
 	u_int		quirks;		/* Chip specific quirks */
+	u_int		quirks2;	/* Chip specific opt-ins */
 	u_int		caps;		/* Override SDHCI_CAPABILITIES */
 	u_int		caps2;		/* Override SDHCI_CAPABILITIES2 */
 	device_t	bus;		/* Bus device */
@@ -362,6 +384,7 @@ struct sdhci_slot {
 #define	SDHCI_NON_REMOVABLE		0x04
 #define	SDHCI_TUNING_SUPPORTED		0x08
 #define	SDHCI_TUNING_ENABLED		0x10
+#define	SDHCI_HAVE_ADMA2		0x20	/* ADMA2 scatter-gather usable */
 #define	SDHCI_SDR50_NEEDS_TUNING	0x20
 #define	SDHCI_SLOT_EMBEDDED		0x40
 	u_char		version;
@@ -374,6 +397,18 @@ struct sdhci_slot {
 	bus_addr_t	paddr;		/* DMA buffer address */
 	uint32_t	sdma_bbufsz;	/* SDMA bounce buffer size */
 	uint8_t		sdma_boundary;	/* SDMA boundary */
+	/* ADMA2 (32-bit descriptors): descriptor table + request buffer map */
+	bus_dma_tag_t	adma_desc_tag;
+	bus_dmamap_t	adma_desc_map;
+	struct sdhci_adma2_desc32 *adma_desc;
+	bus_addr_t	adma_desc_paddr;
+	bus_dma_tag_t	adma_data_tag;
+	bus_dmamap_t	adma_data_map;
+	int		adma_maxsegs;
+	int		adma_nsegs;
+	bus_size_t	adma_total;	/* bytes covered by the table */
+	int		adma_error;	/* descriptor build failed in callback */
+	u_char		adma_loaded;	/* adma_data_map loaded for curcmd */
 	struct task	card_task;	/* Card presence check task */
 	struct timeout_task
 			card_delayed_task;/* Card insert delayed task */
@@ -409,6 +444,7 @@ struct sdhci_slot {
 #define	STOP_STARTED		2
 #define	SDHCI_USE_DMA		4	/* Use DMA for this req. */
 #define	PLATFORM_DATA_STARTED	8	/* Data xfer is handled by platform */
+#define	SDHCI_USE_ADMA2		16	/* This req. is on the ADMA2 path */
 
 #ifdef MMCCAM
 	/* CAM stuff */

@@ -1697,6 +1697,17 @@ sdhci_fdt_spacemit_attach(device_t dev)
 	}
 sdma_default:
 
+	/*
+	 * Use ADMA2 on the eMMC.  Validated on this controller (2026-09-16):
+	 * integrity holds for unaligned, partial-page and multi-segment
+	 * requests and across a path switch, with no ADMA error in any test,
+	 * and sequential reads gain about 6 percent over the SDMA bounce
+	 * buffer.  The SDIO slot is deliberately left on SDMA: it is the one
+	 * with the troubled history here and nothing has been measured on it.
+	 */
+	if (!((struct sdhci_fdt_spacemit_softc *)sc)->sdio_slot)
+		sc->quirks2 |= SDHCI_QUIRK2_USE_ADMA2;
+
 	error = sdhci_fdt_attach(dev);
 	if (error != 0)
 		return (error);
