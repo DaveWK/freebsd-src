@@ -31,6 +31,7 @@
 struct sdhci_fdt_softc {
 	device_t	dev;		/* Controller device */
 	u_int		quirks;		/* Chip specific quirks */
+	u_int		quirks2;	/* Chip specific opt-ins */
 	u_int		caps;		/* If we override SDHCI_CAPABILITIES */
 	uint32_t	max_clk;	/* Max possible freq */
 	uint8_t		sdma_boundary;	/* If we override the SDMA boundary */
