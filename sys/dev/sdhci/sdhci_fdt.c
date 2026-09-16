@@ -430,6 +430,7 @@ sdhci_fdt_attach(device_t dev)
 		}
 
 		slot->quirks = sc->quirks;
+		slot->quirks2 = sc->quirks2;
 		slot->caps = sc->caps;
 		slot->max_clk = sc->max_clk;
 		slot->sdma_boundary = sc->sdma_boundary;
