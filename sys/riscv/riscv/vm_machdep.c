@@ -100,9 +100,15 @@ cpu_fork(struct thread *td1, struct proc *p2, struct thread *td2, int flags)
 		critical_exit();
 	}
 
-	/* Ensure the Vector state is saved before copying the pcb. */
-	if ((td1->td_pcb->pcb_vsflags & PCB_VS_STARTED) != 0) {
+	/*
+	 * Ensure the Vector state is saved before copying the pcb.  Only a
+	 * dirty status means the live registers are newer than the save
+	 * area; off with a save area is a thread back from sigreturn whose
+	 * registers are in the area and not yet reloaded (see trap.c).
+	 */
+	if ((td1->td_frame->tf_sstatus & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY) {
 		MPASS(td1 == curthread);
+		MPASS((td1->td_pcb->pcb_vsflags & PCB_VS_STARTED) != 0);
 		critical_enter();
 		vector_state_store(td1);
 		critical_exit();
