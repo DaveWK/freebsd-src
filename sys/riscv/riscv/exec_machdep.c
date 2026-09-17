@@ -329,8 +329,11 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 
 	/*
 	 * Start from a defined vector status the same way set_fpcontext() does
-	 * for FS; the RISCV_CTX_MAGIC_VS arm below promotes it to clean when it
-	 * restores the vector registers.
+	 * for FS.  It stays off even when the RISCV_CTX_MAGIC_VS arm below
+	 * restores the vector registers: they go into the save area, not the
+	 * hardware, and the first vector instruction after the return traps
+	 * so that trap.c reloads them (a clean status here would let the
+	 * interrupted code run on with the handler's registers).
 	 */
 	tf->tf_sstatus &= ~SSTATUS_VS_MASK;
 	tf->tf_sstatus |= SSTATUS_VS_OFF;
@@ -362,8 +365,6 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 			error = restore_vector_state(pcb, &ctx, addr);
 			if (error)
 				return (EINVAL);
-			tf->tf_sstatus &= ~SSTATUS_VS_MASK;
-			tf->tf_sstatus |= SSTATUS_VS_CLEAN;
 			break;
 		case RISCV_CTX_MAGIC_END:
 			done = true;
@@ -483,6 +484,20 @@ sendsig_ctx_vector(struct thread *td, vm_offset_t *addrp)
 		return (true);
 
 	MPASS(pcb->pcb_vsaved != NULL);
+
+	/*
+	 * The save area is only current while the status is clean (or off,
+	 * after a sigreturn left the registers there).  Dirty means the
+	 * live registers are newer, so store them first, as get_fpcontext()
+	 * does with fpe_state_save().
+	 */
+	if ((td->td_frame->tf_sstatus & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY) {
+		critical_enter();
+		vector_state_store(td);
+		td->td_frame->tf_sstatus &= ~SSTATUS_VS_MASK;
+		td->td_frame->tf_sstatus |= SSTATUS_VS_CLEAN;
+		critical_exit();
+	}
 
 	buf_size = vector_get_size();
 	ctx_size = CTX_SIZE_VS(buf_size);
