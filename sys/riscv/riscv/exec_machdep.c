@@ -305,10 +305,14 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 	 *
 	 * Ignore writes to the FS field as set_fpcontext() will set
 	 * it explicitly.
+	 *
+	 * Ignore writes to the VS field: the vector register state, if any, is
+	 * restored from the register-context list below, and the VS field is
+	 * set there and after set_fpcontext(), the same way FS is.
 	 */
 	if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &
-	    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |
-	    SSTATUS_UIE)) != 0)
+	    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_VS_MASK |
+	    SSTATUS_UPIE | SSTATUS_UIE)) != 0)
 		return (EINVAL);
 
 	memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));
@@ -322,6 +326,14 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 	tf->tf_sstatus = mcp->mc_gpregs.gp_sstatus;
 
 	set_fpcontext(td, mcp);
+
+	/*
+	 * Start from a defined vector status the same way set_fpcontext() does
+	 * for FS; the RISCV_CTX_MAGIC_VS arm below promotes it to clean when it
+	 * restores the vector registers.
+	 */
+	tf->tf_sstatus &= ~SSTATUS_VS_MASK;
+	tf->tf_sstatus |= SSTATUS_VS_OFF;
 
 	if (mcp->mc_ptr == 0)
 		return (0);
@@ -350,6 +362,8 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 			error = restore_vector_state(pcb, &ctx, addr);
 			if (error)
 				return (EINVAL);
+			tf->tf_sstatus &= ~SSTATUS_VS_MASK;
+			tf->tf_sstatus |= SSTATUS_VS_CLEAN;
 			break;
 		case RISCV_CTX_MAGIC_END:
 			done = true;
