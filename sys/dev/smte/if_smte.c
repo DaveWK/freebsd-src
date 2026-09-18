@@ -96,6 +96,7 @@ CTASSERT(MJUMPAGESIZE - ETHER_ALIGN <= RX_DESC1_SIZE1_MASK);
 struct smte_bufmap {
 	bus_dmamap_t	map;
 	struct mbuf	*mbuf;
+	bus_addr_t	paddr;
 };
 
 struct smte_softc {
@@ -134,6 +135,7 @@ struct smte_softc {
 	int		tx_cons;
 	int		tx_used;
 	bus_dma_tag_t	rxbuf_tag;
+	bus_dmamap_t	rx_sparemap;
 	struct smte_bufmap rxbuf[SMTE_NRXDESC];
 	int		rx_cons;
 	int		rx_bufsize;
@@ -351,31 +353,39 @@ smte_rx_bufsize(int mtu)
 }
 
 static int
-smte_newbuf(struct smte_softc *sc, int idx)
+smte_rx_alloc(struct smte_softc *sc, struct smte_bufmap *buf, int size)
 {
 	struct mbuf *m;
 	bus_dma_segment_t seg;
 	int error, nsegs;
 
-	m = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, sc->rx_bufsize);
+	m = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, size);
 	if (m == NULL)
 		return (ENOBUFS);
-	m->m_len = m->m_pkthdr.len = sc->rx_bufsize;
+	m->m_len = m->m_pkthdr.len = size;
 	m_adj(m, ETHER_ALIGN);
 
-	error = bus_dmamap_load_mbuf_sg(sc->rxbuf_tag, sc->rxbuf[idx].map,
+	error = bus_dmamap_load_mbuf_sg(sc->rxbuf_tag, buf->map,
 	    m, &seg, &nsegs, BUS_DMA_NOWAIT);
 	if (error != 0) {
 		m_freem(m);
 		return (error);
 	}
 
+	buf->mbuf = m;
+	buf->paddr = seg.ds_addr;
+	return (0);
+}
+
+static void
+smte_rx_rearm(struct smte_softc *sc, int idx)
+{
+
 	bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf[idx].map,
 	    BUS_DMASYNC_PREREAD);
-
-	sc->rxbuf[idx].mbuf = m;
-	sc->rxdesc[idx].sd_addr1 = (uint32_t)seg.ds_addr;
-	sc->rxdesc[idx].sd_desc1 = seg.ds_len & RX_DESC1_SIZE1_MASK;
+	sc->rxdesc[idx].sd_addr1 = (uint32_t)sc->rxbuf[idx].paddr;
+	sc->rxdesc[idx].sd_desc1 =
+	    (sc->rx_bufsize - ETHER_ALIGN) & RX_DESC1_SIZE1_MASK;
 	if (idx == SMTE_NRXDESC - 1)
 		sc->rxdesc[idx].sd_desc1 |= RX_DESC1_END_RING;
 	bus_dmamap_sync(sc->desc_tag, sc->rxdesc_map,
@@ -383,6 +393,24 @@ smte_newbuf(struct smte_softc *sc, int idx)
 	sc->rxdesc[idx].sd_desc0 = RX_DESC0_OWN;
 	bus_dmamap_sync(sc->desc_tag, sc->rxdesc_map,
 	    BUS_DMASYNC_PREWRITE);
+}
+
+/* Keep the old mapping intact until its replacement is ready. */
+static int
+smte_newbuf(struct smte_softc *sc, int idx)
+{
+	struct smte_bufmap buf;
+	int error;
+
+	buf.map = sc->rx_sparemap;
+	error = smte_rx_alloc(sc, &buf, sc->rx_bufsize);
+	if (error != 0)
+		return (error);
+	if (sc->rxbuf[idx].mbuf != NULL)
+		bus_dmamap_unload(sc->rxbuf_tag, sc->rxbuf[idx].map);
+	sc->rx_sparemap = sc->rxbuf[idx].map;
+	sc->rxbuf[idx] = buf;
+	smte_rx_rearm(sc, idx);
 
 	return (0);
 }
@@ -419,17 +447,18 @@ smte_rxeof(struct smte_softc *sc)
 
 		bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf[idx].map,
 		    BUS_DMASYNC_POSTREAD);
-		bus_dmamap_unload(sc->rxbuf_tag, sc->rxbuf[idx].map);
-
 		m = sc->rxbuf[idx].mbuf;
-		sc->rxbuf[idx].mbuf = NULL;
 
-		if (len < ETHER_CRC_LEN ||
+		if (len < ETHER_CRC_LEN || len > sc->rx_bufsize - ETHER_ALIGN ||
 		    (desc0 & (RX_DESC0_FRAME_RUNT | RX_DESC0_FRAME_CRC_ERR |
 		    RX_DESC0_FRAME_MAX_LEN_ERR | RX_DESC0_FRAME_JABBER_ERR |
 		    RX_DESC0_FRAME_LENGTH_ERR)) != 0) {
 			if_inc_counter(sc->ifp, IFCOUNTER_IERRORS, 1);
-			m_freem(m);
+			smte_rx_rearm(sc, idx);
+		} else if (smte_newbuf(sc, idx) != 0) {
+			/* Drop the packet, but retain a usable DMA buffer. */
+			if_inc_counter(sc->ifp, IFCOUNTER_IQDROPS, 1);
+			smte_rx_rearm(sc, idx);
 		} else {
 			len -= ETHER_CRC_LEN;
 			m->m_pkthdr.len = m->m_len = len;
@@ -441,10 +470,6 @@ smte_rxeof(struct smte_softc *sc)
 				m_freem(m);
 			}
 		}
-
-		/* Reload this slot with a fresh buffer. */
-		if (smte_newbuf(sc, idx) != 0)
-			if_inc_counter(sc->ifp, IFCOUNTER_IQDROPS, 1);
 
 		sc->rx_cons = (idx == SMTE_NRXDESC - 1) ? 0 : idx + 1;
 	}
@@ -580,9 +605,12 @@ smte_reset_rings(struct smte_softc *sc)
 	sc->tx_prod = sc->tx_cons = sc->tx_used = 0;
 	sc->tx_watchdog = 0;
 
-	/* Rx buffers stay mapped; just hand every descriptor back. */
-	for (i = 0; i < SMTE_NRXDESC; i++)
-		sc->rxdesc[i].sd_desc0 = RX_DESC0_OWN;
+	/* Discard pending receives and return the mapped buffers to DMA. */
+	for (i = 0; i < SMTE_NRXDESC; i++) {
+		bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf[i].map,
+		    BUS_DMASYNC_POSTREAD);
+		smte_rx_rearm(sc, i);
+	}
 	sc->rx_cons = 0;
 
 	bus_dmamap_sync(sc->desc_tag, sc->txdesc_map, BUS_DMASYNC_PREWRITE);
@@ -905,33 +933,78 @@ smte_init(void *arg)
 }
 
 /*
- * Re-clothe the receive ring after the MTU, and so the cluster size, has
- * changed.  The caller holds the lock and has stopped the engine.
+ * Prepare every replacement buffer before stopping the interface.  A failed
+ * allocation leaves the MTU, running state and active RX ring untouched.
  */
 static int
-smte_rx_rebuild(struct smte_softc *sc)
+smte_change_mtu(struct smte_softc *sc, int mtu)
 {
-	int error, i;
+	struct smte_bufmap *bufs;
+	bus_dmamap_t map;
+	int error, i, running, size;
 
 	SMTE_ASSERT_LOCKED(sc);
 
-	for (i = 0; i < SMTE_NRXDESC; i++) {
-		if (sc->rxbuf[i].mbuf == NULL)
-			continue;
-		bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf[i].map,
-		    BUS_DMASYNC_POSTREAD);
-		bus_dmamap_unload(sc->rxbuf_tag, sc->rxbuf[i].map);
-		m_freem(sc->rxbuf[i].mbuf);
-		sc->rxbuf[i].mbuf = NULL;
-	}
-	sc->rx_cons = 0;
-	for (i = 0; i < SMTE_NRXDESC; i++) {
-		error = smte_newbuf(sc, i);
-		if (error != 0)
-			return (error);
+	if (mtu < ETHERMIN || mtu > SMTE_MAX_MTU)
+		return (EINVAL);
+	if (mtu == if_getmtu(sc->ifp))
+		return (0);
+
+	size = smte_rx_bufsize(mtu);
+	bufs = NULL;
+	if (size != sc->rx_bufsize) {
+		bufs = malloc(sizeof(*bufs) * SMTE_NRXDESC, M_DEVBUF,
+		    M_NOWAIT | M_ZERO);
+		if (bufs == NULL)
+			return (ENOBUFS);
+		for (i = 0; i < SMTE_NRXDESC; i++) {
+			error = bus_dmamap_create(sc->rxbuf_tag, BUS_DMA_NOWAIT,
+			    &map);
+			if (error != 0)
+				goto fail;
+			bufs[i].map = map;
+			error = smte_rx_alloc(sc, &bufs[i], size);
+			if (error != 0)
+				goto fail;
+		}
 	}
 
+	/* No fallible operations remain after the old configuration is stopped. */
+	running = (if_getdrvflags(sc->ifp) & IFF_DRV_RUNNING) != 0;
+	if (running)
+		smte_stop_locked(sc);
+	if (bufs != NULL) {
+		for (i = 0; i < SMTE_NRXDESC; i++) {
+			bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf[i].map,
+			    BUS_DMASYNC_POSTREAD);
+			bus_dmamap_unload(sc->rxbuf_tag, sc->rxbuf[i].map);
+			m_freem(sc->rxbuf[i].mbuf);
+			bus_dmamap_destroy(sc->rxbuf_tag, sc->rxbuf[i].map);
+			sc->rxbuf[i] = bufs[i];
+		}
+		free(bufs, M_DEVBUF);
+		sc->rx_bufsize = size;
+		sc->rx_cons = 0;
+		for (i = 0; i < SMTE_NRXDESC; i++)
+			smte_rx_rearm(sc, i);
+	}
+	if_setmtu(sc->ifp, mtu);
+	if (running)
+		smte_init_locked(sc);
+
 	return (0);
+
+fail:
+	for (i = 0; i < SMTE_NRXDESC; i++) {
+		if (bufs[i].mbuf != NULL) {
+			bus_dmamap_unload(sc->rxbuf_tag, bufs[i].map);
+			m_freem(bufs[i].mbuf);
+		}
+		if (bufs[i].map != NULL)
+			bus_dmamap_destroy(sc->rxbuf_tag, bufs[i].map);
+	}
+	free(bufs, M_DEVBUF);
+	return (error);
 }
 
 static int
@@ -939,7 +1012,7 @@ smte_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
 	struct smte_softc *sc;
 	struct ifreq *ifr;
-	int error, running;
+	int error;
 
 	sc = if_getsoftc(ifp);
 	ifr = (struct ifreq *)data;
@@ -966,21 +1039,8 @@ smte_ioctl(if_t ifp, u_long cmd, caddr_t data)
 		}
 		break;
 	case SIOCSIFMTU:
-		if (ifr->ifr_mtu < ETHERMIN || ifr->ifr_mtu > SMTE_MAX_MTU) {
-			error = EINVAL;
-			break;
-		}
-		if (if_getmtu(ifp) == ifr->ifr_mtu)
-			break;
 		SMTE_LOCK(sc);
-		running = (if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0;
-		if (running)
-			smte_stop_locked(sc);
-		if_setmtu(ifp, ifr->ifr_mtu);
-		sc->rx_bufsize = smte_rx_bufsize(ifr->ifr_mtu);
-		error = smte_rx_rebuild(sc);
-		if (error == 0 && running)
-			smte_init_locked(sc);
+		error = smte_change_mtu(sc, ifr->ifr_mtu);
 		SMTE_UNLOCK(sc);
 		break;
 	case SIOCSIFMEDIA:
@@ -1057,6 +1117,9 @@ smte_setup_dma(struct smte_softc *sc)
 		return (error);
 
 	sc->rx_bufsize = smte_rx_bufsize(ETHERMTU);
+	error = bus_dmamap_create(sc->rxbuf_tag, 0, &sc->rx_sparemap);
+	if (error != 0)
+		return (error);
 
 	for (i = 0; i < SMTE_NTXDESC; i++) {
 		error = bus_dmamap_create(sc->txbuf_tag, 0,
