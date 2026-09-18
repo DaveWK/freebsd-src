@@ -85,6 +85,8 @@
 
 #define	SMTE_NTXDESC	256
 #define	SMTE_NTXSEGS	16
+#define	SMTE_TX_QUEUE_MIN	(SMTE_NTXDESC - 1)
+#define	SMTE_TX_QUEUE_MAX	4096
 
 /*
  * A receive frame must fit one descriptor: RX_DESC1_SIZE1_MASK is 12 bits,
@@ -192,6 +194,7 @@ struct smte_softc {
 	int		rx_dbg;
 	int		dma_translate;
 	int		tx_pack;
+	int		tx_queue_len;
 	bus_addr_t	dma_lowaddr;
 	int		tx_reclaim_first;
 	uint64_t	service[SMTE_STAT_COUNT];
@@ -329,6 +332,36 @@ smte_service_sysctls(struct smte_softc *sc)
 	    "Opt-in TX reclaim before RX delivery (default 0)");
 }
 
+
+/* Packet queue capacity is independent of the number of DMA descriptors.
+ * Keep the existing default until the larger bounded queue passes hardware
+ * acceptance. Boot-only: changing if_snd limits while enqueue runs would race.
+ */
+static int
+smte_tx_queue_size(int requested)
+{
+
+	if (requested < SMTE_TX_QUEUE_MIN || requested > SMTE_TX_QUEUE_MAX)
+		return (SMTE_TX_QUEUE_MIN);
+	return (requested);
+}
+
+static void
+smte_tx_queue_setup(struct smte_softc *sc)
+{
+	char name[64];
+	int requested;
+
+	requested = SMTE_TX_QUEUE_MIN;
+	snprintf(name, sizeof(name), "hw.smte.%d.tx_queue_len",
+	    device_get_unit(sc->dev));
+	TUNABLE_INT_FETCH(name, &requested);
+	sc->tx_queue_len = smte_tx_queue_size(requested);
+	if (sc->tx_queue_len != requested)
+		device_printf(sc->dev, "invalid TX queue limit %d; using %d\n",
+		    requested, sc->tx_queue_len);
+	if_setsendqlen(sc->ifp, sc->tx_queue_len);
+}
 
 /* Ring ownership is per descriptor; packing may change between packets. */
 static int
@@ -1876,7 +1909,7 @@ smte_attach(device_t dev)
 	if_setstartfn(sc->ifp, smte_start);
 	if_setioctlfn(sc->ifp, smte_ioctl);
 	if_setinitfn(sc->ifp, smte_init);
-	if_setsendqlen(sc->ifp, SMTE_NTXDESC - 1);
+	smte_tx_queue_setup(sc);
 	if_setsendqready(sc->ifp);
 	if_setcapabilities(sc->ifp, IFCAP_VLAN_MTU);
 	if_setcapenable(sc->ifp, if_getcapabilities(sc->ifp));
@@ -1912,6 +1945,10 @@ smte_attach(device_t dev)
 	    "Software-verified IPv4 TCP receive aggregation (default 0)");
 #endif
 	smte_service_sysctls(sc);
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "tx_queue_len", CTLFLAG_RD, &sc->tx_queue_len, 0,
+	    "Bounded TX packet queue capacity (boot-only)");
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "dma_translate", CTLFLAG_RD, &sc->dma_translate, 0,
