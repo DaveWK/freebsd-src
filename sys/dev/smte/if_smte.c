@@ -801,14 +801,17 @@ smte_init_locked(struct smte_softc *sc)
 	WR4(sc, DMA_TRANSMIT_BASE_ADDRESS, (uint32_t)sc->txdesc_paddr);
 	WR4(sc, DMA_RECEIVE_BASE_ADDRESS, (uint32_t)sc->rxdesc_paddr);
 
-	/* Enable completion interrupts. */
+	/*
+	 * Enable only events acknowledged by smte_intr().  RX stopped and
+	 * descriptor-unavailable events are not handled there; enabling them
+	 * leaves a level interrupt asserted indefinitely after RX starvation.
+	 * smte_rxeof() rearms RX with poll demand after draining the ring.
+	 */
 	WR4(sc, DMA_INTR_ENABLE, DMA_INTR_ENABLE_TX_TRANSFER_DONE |
 	    DMA_INTR_ENABLE_TX_DES_UNAVAILABLE |
 	    DMA_INTR_ENABLE_TX_DMA_STOPPED |
 	    DMA_INTR_ENABLE_RX_TRANSFER_DONE |
-	    DMA_INTR_ENABLE_RX_MISSED_FRAME |
-	    DMA_INTR_ENABLE_RX_DMA_STOPPED |
-	    DMA_INTR_ENABLE_RX_DES_UNAVAILABLE);
+	    DMA_INTR_ENABLE_RX_MISSED_FRAME);
 
 	WR4(sc, MAC_TRANSMIT_CTRL,
 	    (RD4(sc, MAC_TRANSMIT_CTRL) & ~MAC_TRANSMIT_CTRL_IFG_LEN_MASK) |
