@@ -131,7 +131,7 @@ enum smte_service_stat {
 struct smte_bufmap {
 	bus_dmamap_t	map;
 	struct mbuf	*mbuf;
-	bus_addr_t	paddr;
+	bus_addr_t	paddr; /* Device address; map retains CPU physical addresses. */
 };
 
 struct smte_softc {
@@ -175,6 +175,8 @@ struct smte_softc {
 	int		rx_cons;
 	int		rx_bufsize;
 	int		rx_dbg;
+	int		dma_translate;
+	bus_addr_t	dma_lowaddr;
 	int		tx_reclaim_first;
 	uint64_t	service[SMTE_STAT_COUNT];
 };
@@ -311,6 +313,98 @@ smte_service_sysctls(struct smte_softc *sc)
 	    "Opt-in TX reclaim before RX delivery (default 0)");
 }
 
+
+/*
+ * Scoped K1 DMA-window support.  busdma remains responsible for CPU cache
+ * maintenance and out-of-reach bouncing; only device addresses are translated.
+ * No arbitrary 64-bit descriptor truncation is permitted.
+ */
+static int
+smte_dma_addr(struct smte_softc *sc, bus_addr_t pa, bus_size_t len,
+    bus_addr_t *da)
+{
+	bus_addr_t base, limit;
+
+	if (len == 0)
+		return (EINVAL);
+	if (!sc->dma_translate) {
+		base = 0;
+		limit = BUS_SPACE_MAXADDR_32BIT;
+	} else if (pa < 0x80000000ULL) {
+		base = 0;
+		limit = 0x7fffffffULL;
+	} else if (pa >= 0x100000000ULL && pa < 0x180000000ULL) {
+		base = 0x80000000ULL;
+		limit = 0x17fffffffULL;
+	} else
+		return (EFBIG);
+	/* Subtraction checks both full extent and overflow before conversion. */
+	if (pa > limit || len - 1 > limit - pa)
+		return (EFBIG);
+	*da = pa - base;
+	return (0);
+}
+
+static int
+smte_dma_window_valid(const pcell_t *cells, size_t bytes)
+{
+	static const pcell_t expected[] = {
+		0, 0, 0, 0, 0, 0x80000000,
+		0, 0x80000000, 1, 0, 0, 0x80000000
+	};
+
+	return (bytes == sizeof(expected) &&
+	    memcmp(cells, expected, sizeof(expected)) == 0);
+}
+
+static void
+smte_dma_configure(struct smte_softc *sc)
+{
+	device_t parent;
+	phandle_t node, ancestor;
+	pcell_t cells[12], ac;
+	char name[64];
+	int requested;
+
+	sc->dma_translate = 0;
+	sc->dma_lowaddr = BUS_SPACE_MAXADDR_32BIT;
+	requested = 0;
+	snprintf(name, sizeof(name), "hw.smte.%d.dma_translate",
+	    device_get_unit(sc->dev));
+	TUNABLE_INT_FETCH(name, &requested);
+	if (requested == 0)
+		return;
+	parent = device_get_parent(sc->dev);
+	node = ofw_bus_get_node(parent);
+	/* NULL parent tag selects the identity RISC-V bounce backend. */
+	if (requested != 1 || bus_get_dma_tag(sc->dev) != NULL ||
+	    node <= 0 || !ofw_bus_is_compatible(parent, "simple-bus") ||
+	    ofw_bus_get_name(parent) == NULL ||
+	    strcmp(ofw_bus_get_name(parent), "network-bus") != 0 ||
+	    OF_getproplen(ofw_bus_get_node(sc->dev), "iommus") > 0 ||
+	    OF_getproplen(ofw_bus_get_node(sc->dev), "dma-ranges") > 0 ||
+	    OF_getproplen(node, "ranges") != 0 ||
+	    OF_getencprop(node, "#address-cells", &ac, sizeof(ac)) != sizeof(ac) ||
+	    ac != 2 ||
+	    OF_getencprop(node, "#size-cells", &ac, sizeof(ac)) != sizeof(ac) ||
+	    ac != 2 ||
+	    OF_getencprop(OF_parent(node), "#address-cells", &ac, sizeof(ac)) != sizeof(ac) ||
+	    ac != 2 || OF_getproplen(node, "dma-ranges") != sizeof(cells) ||
+	    OF_getencprop(node, "dma-ranges", cells, sizeof(cells)) != sizeof(cells) ||
+	    !smte_dma_window_valid(cells, sizeof(cells)))
+		goto unsupported;
+	for (ancestor = OF_parent(node); ancestor > 0;
+	    ancestor = OF_parent(ancestor)) {
+		if (OF_getproplen(ancestor, "dma-ranges") > 0)
+			goto unsupported;
+	}
+	sc->dma_translate = 1;
+	sc->dma_lowaddr = 0x17fffffffULL;
+	device_printf(sc->dev, "using K1 network DMA address windows\n");
+	return;
+unsupported:
+	device_printf(sc->dev, "DMA translation request rejected; retaining 32-bit bounce mapping\n");
+}
 
 /*
  * MII (MDIO) access.
@@ -525,8 +619,16 @@ smte_rx_alloc(struct smte_softc *sc, struct smte_bufmap *buf, int size)
 		return (error);
 	}
 
+	if (nsegs != 1)
+		error = EFBIG;
+	else
+		error = smte_dma_addr(sc, seg.ds_addr, seg.ds_len, &buf->paddr);
+	if (error != 0) {
+		bus_dmamap_unload(sc->rxbuf_tag, buf->map);
+		m_freem(m);
+		return (error);
+	}
 	buf->mbuf = m;
-	buf->paddr = seg.ds_addr;
 	return (0);
 }
 
@@ -690,11 +792,28 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 		return (error);
 	}
 
+	if (nsegs < 1 || nsegs > SMTE_NTXSEGS) {
+		bus_dmamap_unload(sc->txbuf_tag, sc->txbuf[first].map);
+		m_freem(m);
+		*mp = NULL;
+		return (EFBIG);
+	}
 	if (sc->tx_used + nsegs + 1 > SMTE_NTXDESC) {
 		bus_dmamap_unload(sc->txbuf_tag, sc->txbuf[first].map);
 		return (ENOBUFS);
 	}
 
+	/* Validate every device address before modifying or publishing the ring. */
+	for (i = 0; i < nsegs; i++) {
+		if (segs[i].ds_len == 0 || segs[i].ds_len > TX_DESC1_SIZE1_MASK ||
+		    smte_dma_addr(sc, segs[i].ds_addr, segs[i].ds_len,
+		    &segs[i].ds_addr) != 0) {
+			bus_dmamap_unload(sc->txbuf_tag, sc->txbuf[first].map);
+			m_freem(m);
+			*mp = NULL;
+			return (EFBIG);
+		}
+	}
 	bus_dmamap_sync(sc->txbuf_tag, sc->txbuf[first].map,
 	    BUS_DMASYNC_PREWRITE);
 
@@ -1250,22 +1369,41 @@ smte_ioctl(if_t ifp, u_long cmd, caddr_t data)
 /*
  * DMA setup.
  */
+struct smte_ring_load {
+	struct smte_softc *sc;
+	bus_addr_t *device_addr;
+	bus_size_t size;
+	int error;
+};
+
 static void
 smte_get1paddr(void *arg, bus_dma_segment_t *segs, int nsegs, int error)
 {
+	struct smte_ring_load *load;
 
-	if (error == 0)
-		*(bus_addr_t *)arg = segs[0].ds_addr;
+	load = arg;
+	load->error = error;
+	if (error != 0)
+		return;
+	if (nsegs != 1 || segs[0].ds_len != load->size) {
+		load->error = EFBIG;
+		return;
+	}
+	load->error = smte_dma_addr(load->sc, segs[0].ds_addr,
+	    segs[0].ds_len, load->device_addr);
 }
 
 static int
 smte_setup_dma(struct smte_softc *sc)
 {
+	struct smte_ring_load load;
 	int error, i;
 
-	/* Descriptor rings: 32-bit DMA, 8-byte alignment. */
+	smte_dma_configure(sc);
+
+	/* 8-byte rings; constrain CPU physical addresses before translating. */
 	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), 8, 0,
-	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+	    sc->dma_lowaddr, BUS_SPACE_MAXADDR, NULL, NULL,
 	    SMTE_NTXDESC * sizeof(struct smte_desc), 1,
 	    SMTE_NTXDESC * sizeof(struct smte_desc), 0, NULL, NULL,
 	    &sc->desc_tag);
@@ -1277,33 +1415,43 @@ smte_setup_dma(struct smte_softc *sc)
 	    &sc->txdesc_map);
 	if (error != 0)
 		return (error);
+	load = (struct smte_ring_load) { sc, &sc->txdesc_paddr,
+	    SMTE_NTXDESC * sizeof(struct smte_desc), EINPROGRESS };
 	error = bus_dmamap_load(sc->desc_tag, sc->txdesc_map, sc->txdesc,
-	    SMTE_NTXDESC * sizeof(struct smte_desc), smte_get1paddr,
-	    &sc->txdesc_paddr, 0);
+	    load.size, smte_get1paddr, &load, BUS_DMA_NOWAIT);
 	if (error != 0)
 		return (error);
+	if (load.error != 0) {
+		bus_dmamap_unload(sc->desc_tag, sc->txdesc_map);
+		return (load.error);
+	}
 
 	error = bus_dmamem_alloc(sc->desc_tag, (void **)&sc->rxdesc,
 	    BUS_DMA_NOWAIT | BUS_DMA_COHERENT | BUS_DMA_ZERO,
 	    &sc->rxdesc_map);
 	if (error != 0)
 		return (error);
+	load = (struct smte_ring_load) { sc, &sc->rxdesc_paddr,
+	    SMTE_NRXDESC * sizeof(struct smte_desc), EINPROGRESS };
 	error = bus_dmamap_load(sc->desc_tag, sc->rxdesc_map, sc->rxdesc,
-	    SMTE_NRXDESC * sizeof(struct smte_desc), smte_get1paddr,
-	    &sc->rxdesc_paddr, 0);
+	    load.size, smte_get1paddr, &load, BUS_DMA_NOWAIT);
 	if (error != 0)
 		return (error);
+	if (load.error != 0) {
+		bus_dmamap_unload(sc->desc_tag, sc->rxdesc_map);
+		return (load.error);
+	}
 
-	/* Buffer tags: 32-bit DMA. */
+	/* Physical reachability; device fields remain 32-bit after translation. */
 	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), 1, 0,
-	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+	    sc->dma_lowaddr, BUS_SPACE_MAXADDR, NULL, NULL,
 	    MCLBYTES * SMTE_NTXSEGS, SMTE_NTXSEGS, MCLBYTES, 0, NULL, NULL,
 	    &sc->txbuf_tag);
 	if (error != 0)
 		return (error);
 
 	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), 1, 0,
-	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+	    sc->dma_lowaddr, BUS_SPACE_MAXADDR, NULL, NULL,
 	    MJUMPAGESIZE, 1, MJUMPAGESIZE, 0, NULL, NULL, &sc->rxbuf_tag);
 	if (error != 0)
 		return (error);
@@ -1602,6 +1750,10 @@ smte_attach(device_t dev)
 
 	ether_ifattach(sc->ifp, lladdr);
 	smte_service_sysctls(sc);
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "dma_translate", CTLFLAG_RD, &sc->dma_translate, 0,
+	    "K1 DMA window translation active (boot-only)");
 
 	return (0);
 }
