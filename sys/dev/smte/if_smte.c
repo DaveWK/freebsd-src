@@ -544,8 +544,8 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 }
 
 /*
- * Return both rings to their post-attach state.  Used by the watchdog
- * restart path: smte_init_locked() reprograms DMA_{TRANSMIT,RECEIVE}_BASE_
+ * Return both rings to their post-attach state after stopping the DMA
+ * engines: smte_init_locked() reprograms DMA_{TRANSMIT,RECEIVE}_BASE_
  * ADDRESS, which parks the hardware back on descriptor 0, so the software
  * producer/consumer indices have to be rewound to match or the two sides
  * address different descriptors from then on.
@@ -754,6 +754,14 @@ smte_stop_locked(struct smte_softc *sc)
 	WR4(sc, MAC_TRANSMIT_CTRL, 0);
 	WR4(sc, MAC_RECEIVE_CTRL, 0);
 	WR4(sc, DMA_CTRL, 0);
+
+	/*
+	 * init restarts DMA at descriptor zero.  Quiesce the engines before
+	 * freeing pending TX buffers, then rewind both software rings for
+	 * every stop/init path, including MTU changes and interface down/up.
+	 */
+	smte_dma_reset(sc);
+	smte_reset_rings(sc);
 }
 
 static void
@@ -861,8 +869,6 @@ smte_tick(void *arg)
 		 */
 		smte_txeof(sc);
 		smte_stop_locked(sc);
-		smte_dma_reset(sc);
-		smte_reset_rings(sc);
 		smte_init_locked(sc);
 		if (!if_sendq_empty(sc->ifp))
 			smte_start_locked(sc->ifp);
