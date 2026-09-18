@@ -176,6 +176,7 @@ struct smte_softc {
 	int		rx_bufsize;
 	int		rx_dbg;
 	int		dma_translate;
+	int		tx_pack;
 	bus_addr_t	dma_lowaddr;
 	int		tx_reclaim_first;
 	uint64_t	service[SMTE_STAT_COUNT];
@@ -313,6 +314,28 @@ smte_service_sysctls(struct smte_softc *sc)
 	    "Opt-in TX reclaim before RX delivery (default 0)");
 }
 
+
+/* Ring ownership is per descriptor; packing may change between packets. */
+static int
+smte_tx_pack_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct smte_softc *sc;
+	int error, value;
+
+	sc = arg1;
+	SMTE_LOCK(sc);
+	value = sc->tx_pack;
+	SMTE_UNLOCK(sc);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value != 0 && value != 1)
+		return (EINVAL);
+	SMTE_LOCK(sc);
+	sc->tx_pack = value;
+	SMTE_UNLOCK(sc);
+	return (0);
+}
 
 /*
  * Scoped K1 DMA-window support.  busdma remains responsible for CPU cache
@@ -766,7 +789,7 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 	bus_dma_segment_t segs[SMTE_NTXSEGS];
 	struct smte_desc *txd;
 	struct mbuf *m;
-	int error, first, i, idx, nsegs;
+	int error, first, i, idx, nsegs, ndesc, stride;
 
 	SMTE_ASSERT_LOCKED(sc);
 
@@ -798,7 +821,9 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 		*mp = NULL;
 		return (EFBIG);
 	}
-	if (sc->tx_used + nsegs + 1 > SMTE_NTXDESC) {
+	stride = sc->tx_pack ? 2 : 1;
+	ndesc = howmany(nsegs, stride);
+	if (sc->tx_used + ndesc + 1 > SMTE_NTXDESC) {
 		bus_dmamap_unload(sc->txbuf_tag, sc->txbuf[first].map);
 		return (ENOBUFS);
 	}
@@ -817,10 +842,16 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 	bus_dmamap_sync(sc->txbuf_tag, sc->txbuf[first].map,
 	    BUS_DMASYNC_PREWRITE);
 
-	for (i = 0; i < nsegs; i++) {
+	for (i = 0; i < nsegs; i += stride) {
 		txd = &sc->txdesc[idx];
+		txd->sd_desc0 = 0;
 		txd->sd_addr1 = (uint32_t)segs[i].ds_addr;
+		txd->sd_addr2 = 0;
 		txd->sd_desc1 = segs[i].ds_len & TX_DESC1_SIZE1_MASK;
+		if (stride == 2 && i + 1 < nsegs) {
+			txd->sd_addr2 = (uint32_t)segs[i + 1].ds_addr;
+			txd->sd_desc1 |= segs[i + 1].ds_len << 12;
+		}
 		if (idx == SMTE_NTXDESC - 1)
 			txd->sd_desc1 |= TX_DESC1_END_RING;
 		if (i == 0)
@@ -831,7 +862,7 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 		 * frames are only reclaimed when an RX interrupt or the 1 Hz
 		 * tick happens to run smte_txeof().
 		 */
-		if (i == nsegs - 1)
+		if (i + stride >= nsegs)
 			txd->sd_desc1 |= TX_DESC1_LAST_SEGMENT |
 			    TX_DESC1_INTERRUPT_ON_COMPLETION;
 		if (i != 0)
@@ -860,7 +891,7 @@ smte_encap(struct smte_softc *sc, struct mbuf **mp)
 	bus_dmamap_sync(sc->desc_tag, sc->txdesc_map, BUS_DMASYNC_PREWRITE);
 
 	sc->tx_prod = idx;
-	sc->tx_used += nsegs;
+	sc->tx_used += ndesc;
 
 	return (0);
 }
@@ -969,7 +1000,8 @@ smte_start_locked(if_t ifp)
 
 	queued = 0;
 	for (;;) {
-		if (sc->tx_used + SMTE_NTXSEGS + 1 > SMTE_NTXDESC) {
+		if (sc->tx_used + howmany(SMTE_NTXSEGS, sc->tx_pack ? 2 : 1) +
+		    1 > SMTE_NTXDESC) {
 			sc->service[SMTE_STAT_TX_RING_BLOCKED]++;
 			if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
 			break;
@@ -1754,6 +1786,11 @@ smte_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
 	    "dma_translate", CTLFLAG_RD, &sc->dma_translate, 0,
 	    "K1 DMA window translation active (boot-only)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "tx_pack", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, smte_tx_pack_sysctl, "I",
+	    "Pack two segments per TX descriptor (default 0)");
 
 	return (0);
 }
