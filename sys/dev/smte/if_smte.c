@@ -31,6 +31,8 @@
  * "spacemit,apmu" (<phandle offset>) property via syscon(4).
  */
 
+#include "opt_inet.h"
+
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
@@ -56,6 +58,13 @@
 #include <net/if_media.h>
 #include <net/if_types.h>
 #include <net/if_var.h>
+#ifdef INET
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/tcp_lro.h>
+#include <machine/in_cksum.h>
+#endif
 
 #include <dev/mii/mii.h>
 #include <dev/mii/miivar.h>
@@ -135,6 +144,12 @@ struct smte_bufmap {
 };
 
 struct smte_softc {
+#ifdef INET
+	/* Single interrupt consumer; flushed at every unlocked RX handoff. */
+	struct lro_ctrl sw_lro_ctrl;
+	int sw_lro_ready;
+	int sw_lro;
+#endif
 	device_t	dev;
 	struct resource	*mem_res;
 	struct resource	*irq_res;
@@ -693,6 +708,98 @@ smte_newbuf(struct smte_softc *sc, int idx)
 	return (0);
 }
 
+#ifdef INET
+/*
+ * The MAC has no supported transport checksum offload. Verify the original
+ * single-buffer IPv4/TCP packet in software before giving LRO trusted metadata.
+ * All other traffic follows the original stack path; no header bytes change.
+ */
+static int
+smte_sw_lro_verified(struct mbuf *m)
+{
+	const struct ether_header *eh;
+	const struct ip *ip;
+	const struct tcphdr *th;
+	int iplen, tcplen, thlen;
+	uint16_t sum;
+
+	if (m->m_next != NULL || m->m_len != m->m_pkthdr.len ||
+	    m->m_len < ETHER_HDR_LEN + sizeof(*ip) + sizeof(*th))
+		return (0);
+	eh = mtod(m, const struct ether_header *);
+	if (eh->ether_type != htons(ETHERTYPE_IP) ||
+	    (eh->ether_dhost[0] & 1) != 0)
+		return (0);
+	ip = (const struct ip *)(m->m_data + ETHER_HDR_LEN);
+	if (ip->ip_v != 4 || ip->ip_hl != 5 || ip->ip_p != IPPROTO_TCP ||
+	    (ip->ip_off & htons(IP_MF | IP_OFFMASK)) != 0)
+		return (0);
+	iplen = ntohs(ip->ip_len);
+	if (iplen < sizeof(*ip) + sizeof(*th) ||
+	    iplen > m->m_len - ETHER_HDR_LEN)
+		return (0);
+	tcplen = iplen - sizeof(*ip);
+	th = (const struct tcphdr *)(ip + 1);
+	thlen = th->th_off << 2;
+	if (thlen < sizeof(*th) || thlen > tcplen || in_cksum_hdr(ip) != 0)
+		return (0);
+	sum = in_cksum_skip(m, ETHER_HDR_LEN + iplen,
+	    ETHER_HDR_LEN + sizeof(*ip));
+	sum = in_addword((uint16_t)~sum, in_pseudo(ip->ip_src.s_addr,
+	    ip->ip_dst.s_addr, htonl(tcplen + IPPROTO_TCP)));
+	if (sum != 0xffff)
+		return (0);
+	m->m_pkthdr.csum_flags |= CSUM_IP_CHECKED | CSUM_IP_VALID |
+	    CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
+	m->m_pkthdr.csum_data = 0xffff;
+	return (1);
+}
+
+static void
+smte_sw_lro_deliver(struct smte_softc *sc, struct mbufq *mq, int use_lro)
+{
+	struct mbuf *m;
+
+	/* Called only by the serialized interrupt consumer, without sc->mtx. */
+	while ((m = mbufq_dequeue(mq)) != NULL) {
+		if (use_lro) {
+			if (smte_sw_lro_verified(m) &&
+			    tcp_lro_rx(&sc->sw_lro_ctrl, m, 0) == 0)
+				continue;
+			/* Keep rejected/unsupported packets in stream order. */
+			tcp_lro_flush_all(&sc->sw_lro_ctrl);
+		}
+		if_input(sc->ifp, m);
+	}
+	if (use_lro)
+		tcp_lro_flush_all(&sc->sw_lro_ctrl);
+}
+
+static int
+smte_sw_lro_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct smte_softc *sc;
+	int error, value;
+
+	sc = arg1;
+	SMTE_LOCK(sc);
+	value = sc->sw_lro;
+	SMTE_UNLOCK(sc);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value != 0 && value != 1)
+		return (EINVAL);
+	SMTE_LOCK(sc);
+	if (value != 0 && !sc->sw_lro_ready)
+		error = ENXIO;
+	else
+		sc->sw_lro = value;
+	SMTE_UNLOCK(sc);
+	return (error);
+}
+#endif
+
 static void
 smte_rxeof(struct smte_softc *sc)
 {
@@ -700,6 +807,9 @@ smte_rxeof(struct smte_softc *sc)
 	struct mbuf *m;
 	uint32_t desc0;
 	int budget, idx, len;
+#ifdef INET
+	int use_lro;
+#endif
 	sbintime_t phase_start;
 
 	SMTE_ASSERT_LOCKED(sc);
@@ -770,9 +880,16 @@ smte_rxeof(struct smte_softc *sc)
 	/* Hand the batch to the stack without holding our lock. */
 	if (mbufq_len(&mq) > 0) {
 		phase_start = sbinuptime();
+#ifdef INET
+		use_lro = sc->sw_lro && sc->sw_lro_ready;
+#endif
 		SMTE_UNLOCK(sc);
+#ifdef INET
+		smte_sw_lro_deliver(sc, &mq, use_lro);
+#else
 		while ((m = mbufq_dequeue(&mq)) != NULL)
 			if_input(sc->ifp, m);
+#endif
 		SMTE_LOCK(sc);
 		smte_service_time(sc, SMTE_STAT_RX_HANDOFF_NS,
 		    SMTE_STAT_RX_HANDOFF_MAX_NS, phase_start);
@@ -1781,6 +1898,19 @@ smte_attach(device_t dev)
 	}
 
 	ether_ifattach(sc->ifp, lladdr);
+#ifdef INET
+	/* Detach returns EBUSY; state lives for this device's whole boot. */
+	error = tcp_lro_init_args(&sc->sw_lro_ctrl, sc->ifp, 16, 0);
+	if (error == 0)
+		sc->sw_lro_ready = 1;
+	else
+		device_printf(dev, "software LRO unavailable: %d\n", error);
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "sw_lro", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, smte_sw_lro_sysctl, "I",
+	    "Software-verified IPv4 TCP receive aggregation (default 0)");
+#endif
 	smte_service_sysctls(sc);
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
