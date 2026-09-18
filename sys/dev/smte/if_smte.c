@@ -44,6 +44,8 @@
 #include <sys/gpio.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 
 #include <machine/bus.h>
 
@@ -86,6 +88,39 @@
     ETHER_VLAN_ENCAP_LEN - ETHER_CRC_LEN)
 CTASSERT(MJUMPAGESIZE - ETHER_ALIGN <= RX_DESC1_SIZE1_MASK);
 #define	SMTE_NRXDESC	256
+
+/* Diagnostic candidate: counters are not part of the accepted ABI. */
+#define SMTE_SERVICE_DIAGNOSTICS 1
+#define SMTE_DMA_MISSED_FRAME_COUNTER 0x0024
+
+enum smte_service_stat {
+	SMTE_STAT_INTR_CALLS,
+	SMTE_STAT_INTR_NS,
+	SMTE_STAT_INTR_MAX_NS,
+	SMTE_STAT_INTR_LOCK_WAIT_NS,
+	SMTE_STAT_INTR_LOCK_WAIT_MAX_NS,
+	SMTE_STAT_RX_CALLS,
+	SMTE_STAT_RX_DESCRIPTORS,
+	SMTE_STAT_RX_BUDGET_EXHAUSTED,
+	SMTE_STAT_RX_BATCH_MAX,
+	SMTE_STAT_RX_DRAIN_NS,
+	SMTE_STAT_RX_DRAIN_MAX_NS,
+	SMTE_STAT_RX_HANDOFF_NS,
+	SMTE_STAT_RX_HANDOFF_MAX_NS,
+	SMTE_STAT_DMA_MISSED_RAW_TOTAL,
+	SMTE_STAT_DMA_MISSED_RAW_OR,
+	SMTE_STAT_DMA_MISSED_RAW_MAX,
+	SMTE_STAT_DMA_MISSED_DRAIN_RAW,
+	SMTE_STAT_DMA_MISSED_HANDOFF_RAW,
+	SMTE_STAT_DMA_MISSED_OTHER_RAW,
+	SMTE_STAT_TX_USED_MAX,
+	SMTE_STAT_TX_RECLAIMED,
+	SMTE_STAT_TX_RECLAIM_NS,
+	SMTE_STAT_TX_RECLAIM_MAX_NS,
+	SMTE_STAT_TX_RING_BLOCKED,
+	SMTE_STAT_TX_EARLY_RECLAIMS,
+	SMTE_STAT_COUNT
+};
 
 #define	SMTE_LOCK(sc)		mtx_lock(&(sc)->mtx)
 #define	SMTE_UNLOCK(sc)		mtx_unlock(&(sc)->mtx)
@@ -140,6 +175,8 @@ struct smte_softc {
 	int		rx_cons;
 	int		rx_bufsize;
 	int		rx_dbg;
+	int		tx_reclaim_first;
+	uint64_t	service[SMTE_STAT_COUNT];
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -158,6 +195,122 @@ static void smte_dma_reset(struct smte_softc *sc);
 static void smte_init_locked(struct smte_softc *sc);
 static void smte_start_locked(if_t ifp);
 static void smte_tick(void *arg);
+
+/* All service counters and the experimental switch use the driver lock. */
+static void
+smte_service_time(struct smte_softc *sc, int total, int peak, sbintime_t start)
+{
+	uint64_t elapsed;
+
+	SMTE_ASSERT_LOCKED(sc);
+	elapsed = sbttons(sbinuptime() - start);
+	sc->service[total] += elapsed;
+	if (elapsed > sc->service[peak])
+		sc->service[peak] = elapsed;
+}
+
+static void
+smte_service_missed(struct smte_softc *sc, int phase)
+{
+	uint32_t raw;
+
+	SMTE_ASSERT_LOCKED(sc);
+	/* Read clears the hardware counter. Keep raw bits; no overflow guess. */
+	raw = RD4(sc, SMTE_DMA_MISSED_FRAME_COUNTER);
+	sc->service[SMTE_STAT_DMA_MISSED_RAW_TOTAL] += raw;
+	sc->service[SMTE_STAT_DMA_MISSED_RAW_OR] |= raw;
+	if (raw > sc->service[SMTE_STAT_DMA_MISSED_RAW_MAX])
+		sc->service[SMTE_STAT_DMA_MISSED_RAW_MAX] = raw;
+	sc->service[phase] += raw;
+}
+
+static int
+smte_service_counter(SYSCTL_HANDLER_ARGS)
+{
+	struct smte_softc *sc;
+	uint64_t value;
+
+	sc = arg1;
+	if (arg2 < 0 || arg2 >= SMTE_STAT_COUNT)
+		return (EINVAL);
+	SMTE_LOCK(sc);
+	value = sc->service[arg2];
+	SMTE_UNLOCK(sc);
+	return (sysctl_handle_64(oidp, &value, 0, req));
+}
+
+static int
+smte_service_order(SYSCTL_HANDLER_ARGS)
+{
+	struct smte_softc *sc;
+	int error, value;
+
+	sc = arg1;
+	SMTE_LOCK(sc);
+	value = sc->tx_reclaim_first;
+	SMTE_UNLOCK(sc);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value != 0 && value != 1)
+		return (EINVAL);
+	SMTE_LOCK(sc);
+	sc->tx_reclaim_first = value;
+	SMTE_UNLOCK(sc);
+	return (0);
+}
+
+static void
+smte_service_sysctls(struct smte_softc *sc)
+{
+	static const char * const names[SMTE_STAT_COUNT] = {
+		"intr_calls",
+		"intr_ns",
+		"intr_max_ns",
+		"intr_lock_wait_ns",
+		"intr_lock_wait_max_ns",
+		"rx_calls",
+		"rx_descriptors",
+		"rx_budget_exhausted",
+		"rx_batch_max",
+		"rx_drain_ns",
+		"rx_drain_max_ns",
+		"rx_handoff_ns",
+		"rx_handoff_max_ns",
+		"dma_missed_raw_total",
+		"dma_missed_raw_or",
+		"dma_missed_raw_max",
+		"dma_missed_drain_raw",
+		"dma_missed_handoff_raw",
+		"dma_missed_other_raw",
+		"tx_used_max",
+		"tx_reclaimed",
+		"tx_reclaim_ns",
+		"tx_reclaim_max_ns",
+		"tx_ring_blocked",
+		"tx_early_reclaims",
+	};
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
+	int i;
+
+	ctx = device_get_sysctl_ctx(sc->dev);
+	tree = SYSCTL_ADD_NODE(ctx,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
+	    "service", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+	    "Experimental SMTE service diagnostics");
+	if (tree == NULL)
+		return;
+	for (i = 0; i < SMTE_STAT_COUNT; i++)
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, names[i],
+		    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, i,
+		    smte_service_counter, "QU", "Cumulative diagnostic (raw DMA or ns where named)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "tx_reclaim_first", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, smte_service_order, "I",
+	    "Opt-in TX reclaim before RX delivery (default 0)");
+}
+
 
 /*
  * MII (MDIO) access.
@@ -422,9 +575,12 @@ smte_rxeof(struct smte_softc *sc)
 	struct mbuf *m;
 	uint32_t desc0;
 	int budget, idx, len;
+	sbintime_t phase_start;
 
 	SMTE_ASSERT_LOCKED(sc);
 
+	sc->service[SMTE_STAT_RX_CALLS]++;
+	phase_start = sbinuptime();
 	mbufq_init(&mq, SMTE_NRXDESC);
 
 	/*
@@ -442,6 +598,7 @@ smte_rxeof(struct smte_softc *sc)
 		if ((desc0 & RX_DESC0_OWN) != 0)
 			break;
 
+		sc->service[SMTE_STAT_RX_DESCRIPTORS]++;
 		len = (desc0 & RX_DESC0_FRAME_PACKET_LENGTH_MASK) >>
 		    RX_DESC0_FRAME_PACKET_LENGTH_SHIFT;
 
@@ -474,15 +631,27 @@ smte_rxeof(struct smte_softc *sc)
 		sc->rx_cons = (idx == SMTE_NRXDESC - 1) ? 0 : idx + 1;
 	}
 
+	if (budget == 0)
+		sc->service[SMTE_STAT_RX_BUDGET_EXHAUSTED]++;
+	if ((uint64_t)mbufq_len(&mq) > sc->service[SMTE_STAT_RX_BATCH_MAX])
+		sc->service[SMTE_STAT_RX_BATCH_MAX] = mbufq_len(&mq);
+	smte_service_time(sc, SMTE_STAT_RX_DRAIN_NS,
+	    SMTE_STAT_RX_DRAIN_MAX_NS, phase_start);
+	smte_service_missed(sc, SMTE_STAT_DMA_MISSED_DRAIN_RAW);
+
 	/* Restart the receive engine in case it stopped on a full ring. */
 	WR4(sc, DMA_RECEIVE_POLL_DEMAND, 1);
 
 	/* Hand the batch to the stack without holding our lock. */
 	if (mbufq_len(&mq) > 0) {
+		phase_start = sbinuptime();
 		SMTE_UNLOCK(sc);
 		while ((m = mbufq_dequeue(&mq)) != NULL)
 			if_input(sc->ifp, m);
 		SMTE_LOCK(sc);
+		smte_service_time(sc, SMTE_STAT_RX_HANDOFF_NS,
+		    SMTE_STAT_RX_HANDOFF_MAX_NS, phase_start);
+		smte_service_missed(sc, SMTE_STAT_DMA_MISSED_HANDOFF_RAW);
 	}
 }
 
@@ -622,12 +791,15 @@ smte_txeof(struct smte_softc *sc)
 {
 	struct smte_desc *txd;
 	int idx, freed;
+	sbintime_t start;
 
 	SMTE_ASSERT_LOCKED(sc);
+	start = sbinuptime();
 
 	bus_dmamap_sync(sc->desc_tag, sc->txdesc_map,
 	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-
+	if ((uint64_t)sc->tx_used > sc->service[SMTE_STAT_TX_USED_MAX])
+		sc->service[SMTE_STAT_TX_USED_MAX] = sc->tx_used;
 	freed = 0;
 	while (sc->tx_cons != sc->tx_prod) {
 		idx = sc->tx_cons;
@@ -657,6 +829,9 @@ smte_txeof(struct smte_softc *sc)
 
 	if (sc->tx_used == 0)
 		sc->tx_watchdog = 0;
+	sc->service[SMTE_STAT_TX_RECLAIMED] += freed;
+	smte_service_time(sc, SMTE_STAT_TX_RECLAIM_NS,
+	    SMTE_STAT_TX_RECLAIM_MAX_NS, start);
 }
 
 static void
@@ -676,6 +851,7 @@ smte_start_locked(if_t ifp)
 	queued = 0;
 	for (;;) {
 		if (sc->tx_used + SMTE_NTXSEGS + 1 > SMTE_NTXDESC) {
+			sc->service[SMTE_STAT_TX_RING_BLOCKED]++;
 			if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, 0);
 			break;
 		}
@@ -722,9 +898,13 @@ smte_intr(void *arg)
 {
 	struct smte_softc *sc;
 	uint32_t stat;
+	sbintime_t start;
 
 	sc = arg;
+	start = sbinuptime();
 	SMTE_LOCK(sc);
+	smte_service_time(sc, SMTE_STAT_INTR_LOCK_WAIT_NS,
+	    SMTE_STAT_INTR_LOCK_WAIT_MAX_NS, start);
 
 	stat = RD4(sc, DMA_STATUS_IRQ);
 
@@ -745,6 +925,16 @@ smte_intr(void *arg)
 		return;
 	}
 	WR4(sc, DMA_STATUS_IRQ, stat);
+	sc->service[SMTE_STAT_INTR_CALLS]++;
+	smte_service_missed(sc, SMTE_STAT_DMA_MISSED_OTHER_RAW);
+
+	/* Reclaim only: do not delay RX with an extra TX enqueue pass. */
+	if (sc->tx_reclaim_first && sc->tx_used != 0 &&
+	    (stat & (DMA_STATUS_IRQ_RX_TRANSFER_DONE |
+	    DMA_STATUS_IRQ_RX_MISSED_FRAME)) != 0) {
+		sc->service[SMTE_STAT_TX_EARLY_RECLAIMS]++;
+		smte_txeof(sc);
+	}
 
 	if ((stat & (DMA_STATUS_IRQ_RX_TRANSFER_DONE |
 	    DMA_STATUS_IRQ_RX_MISSED_FRAME)) != 0)
@@ -770,6 +960,8 @@ smte_intr(void *arg)
 			WR4(sc, DMA_TRANSMIT_POLL_DEMAND, 0xff);
 	}
 
+	smte_service_missed(sc, SMTE_STAT_DMA_MISSED_OTHER_RAW);
+	smte_service_time(sc, SMTE_STAT_INTR_NS, SMTE_STAT_INTR_MAX_NS, start);
 	SMTE_UNLOCK(sc);
 }
 
@@ -1409,6 +1601,7 @@ smte_attach(device_t dev)
 	}
 
 	ether_ifattach(sc->ifp, lladdr);
+	smte_service_sysctls(sc);
 
 	return (0);
 }
