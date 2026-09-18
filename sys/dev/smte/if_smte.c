@@ -393,13 +393,19 @@ smte_rxeof(struct smte_softc *sc)
 	struct mbufq mq;
 	struct mbuf *m;
 	uint32_t desc0;
-	int idx, len;
+	int budget, idx, len;
 
 	SMTE_ASSERT_LOCKED(sc);
 
 	mbufq_init(&mq, SMTE_NRXDESC);
 
-	for (;;) {
+	/*
+	 * Hardware can refill descriptors while we drain them.  Limit a pass
+	 * to the local queue capacity so wrapping the ring cannot overrun mq.
+	 * Completions after the interrupt acknowledgement remain pending for
+	 * the next pass (or the RX mitigation timer).
+	 */
+	for (budget = SMTE_NRXDESC; budget > 0; budget--) {
 		idx = sc->rx_cons;
 
 		bus_dmamap_sync(sc->desc_tag, sc->rxdesc_map,
@@ -430,7 +436,10 @@ smte_rxeof(struct smte_softc *sc)
 			m->m_pkthdr.rcvif = sc->ifp;
 
 			if_inc_counter(sc->ifp, IFCOUNTER_IPACKETS, 1);
-				(void)mbufq_enqueue(&mq, m);
+			if (mbufq_enqueue(&mq, m) != 0) {
+				if_inc_counter(sc->ifp, IFCOUNTER_IQDROPS, 1);
+				m_freem(m);
+			}
 		}
 
 		/* Reload this slot with a fresh buffer. */
