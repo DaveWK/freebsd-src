@@ -74,6 +74,17 @@
 
 #define	SMTE_NTXDESC	256
 #define	SMTE_NTXSEGS	16
+
+/*
+ * A receive frame must fit one descriptor: RX_DESC1_SIZE1_MASK is 12 bits,
+ * so the buffer handed to the engine cannot exceed 4095 bytes.  A page
+ * cluster less the alignment pad is the largest that qualifies, which caps
+ * the MTU below the MAC's jumbo jabber limit.  True 9K frames would need the
+ * receive path to chain descriptors, which it does not do.
+ */
+#define	SMTE_MAX_MTU	(MJUMPAGESIZE - ETHER_ALIGN - ETHER_HDR_LEN - \
+    ETHER_VLAN_ENCAP_LEN - ETHER_CRC_LEN)
+CTASSERT(MJUMPAGESIZE - ETHER_ALIGN <= RX_DESC1_SIZE1_MASK);
 #define	SMTE_NRXDESC	256
 
 #define	SMTE_LOCK(sc)		mtx_lock(&(sc)->mtx)
@@ -125,6 +136,7 @@ struct smte_softc {
 	bus_dma_tag_t	rxbuf_tag;
 	struct smte_bufmap rxbuf[SMTE_NRXDESC];
 	int		rx_cons;
+	int		rx_bufsize;
 	int		rx_dbg;
 };
 
@@ -327,6 +339,17 @@ smte_setup_rxfilter(struct smte_softc *sc)
 /*
  * Receive ring.
  */
+/* Smallest cluster that holds a full frame for this MTU, plus the pad. */
+static int
+smte_rx_bufsize(int mtu)
+{
+
+	if (mtu + ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN + ETHER_CRC_LEN +
+	    ETHER_ALIGN <= MCLBYTES)
+		return (MCLBYTES);
+	return (MJUMPAGESIZE);
+}
+
 static int
 smte_newbuf(struct smte_softc *sc, int idx)
 {
@@ -334,10 +357,10 @@ smte_newbuf(struct smte_softc *sc, int idx)
 	bus_dma_segment_t seg;
 	int error, nsegs;
 
-	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
+	m = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, sc->rx_bufsize);
 	if (m == NULL)
 		return (ENOBUFS);
-	m->m_len = m->m_pkthdr.len = MCLBYTES;
+	m->m_len = m->m_pkthdr.len = sc->rx_bufsize;
 	m_adj(m, ETHER_ALIGN);
 
 	error = bus_dmamap_load_mbuf_sg(sc->rxbuf_tag, sc->rxbuf[idx].map,
@@ -750,7 +773,8 @@ smte_init_locked(struct smte_softc *sc)
 	WR4(sc, MAC_TRANSMIT_FIFO_ALMOST_FULL, 0x1f8);
 	WR4(sc, MAC_TRANSMIT_PACKET_START_THRESHOLD, 1518);
 	WR4(sc, MAC_RECEIVE_PACKET_START_THRESHOLD, 12);
-	WR4(sc, MAC_MAXIMUM_FRAME_SIZE, ETHER_MAX_LEN);
+	WR4(sc, MAC_MAXIMUM_FRAME_SIZE, if_getmtu(ifp) + ETHER_HDR_LEN +
+	    ETHER_VLAN_ENCAP_LEN + ETHER_CRC_LEN);
 	WR4(sc, MAC_TRANSMIT_JABBER_SIZE, ETHER_MAX_LEN_JUMBO);
 	WR4(sc, MAC_RECEIVE_JABBER_SIZE, ETHER_MAX_LEN_JUMBO);
 
@@ -862,12 +886,42 @@ smte_init(void *arg)
 	SMTE_UNLOCK(sc);
 }
 
+/*
+ * Re-clothe the receive ring after the MTU, and so the cluster size, has
+ * changed.  The caller holds the lock and has stopped the engine.
+ */
+static int
+smte_rx_rebuild(struct smte_softc *sc)
+{
+	int error, i;
+
+	SMTE_ASSERT_LOCKED(sc);
+
+	for (i = 0; i < SMTE_NRXDESC; i++) {
+		if (sc->rxbuf[i].mbuf == NULL)
+			continue;
+		bus_dmamap_sync(sc->rxbuf_tag, sc->rxbuf[i].map,
+		    BUS_DMASYNC_POSTREAD);
+		bus_dmamap_unload(sc->rxbuf_tag, sc->rxbuf[i].map);
+		m_freem(sc->rxbuf[i].mbuf);
+		sc->rxbuf[i].mbuf = NULL;
+	}
+	sc->rx_cons = 0;
+	for (i = 0; i < SMTE_NRXDESC; i++) {
+		error = smte_newbuf(sc, i);
+		if (error != 0)
+			return (error);
+	}
+
+	return (0);
+}
+
 static int
 smte_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
 	struct smte_softc *sc;
 	struct ifreq *ifr;
-	int error;
+	int error, running;
 
 	sc = if_getsoftc(ifp);
 	ifr = (struct ifreq *)data;
@@ -892,6 +946,24 @@ smte_ioctl(if_t ifp, u_long cmd, caddr_t data)
 			smte_setup_rxfilter(sc);
 			SMTE_UNLOCK(sc);
 		}
+		break;
+	case SIOCSIFMTU:
+		if (ifr->ifr_mtu < ETHERMIN || ifr->ifr_mtu > SMTE_MAX_MTU) {
+			error = EINVAL;
+			break;
+		}
+		if (if_getmtu(ifp) == ifr->ifr_mtu)
+			break;
+		SMTE_LOCK(sc);
+		running = (if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0;
+		if (running)
+			smte_stop_locked(sc);
+		if_setmtu(ifp, ifr->ifr_mtu);
+		sc->rx_bufsize = smte_rx_bufsize(ifr->ifr_mtu);
+		error = smte_rx_rebuild(sc);
+		if (error == 0 && running)
+			smte_init_locked(sc);
+		SMTE_UNLOCK(sc);
 		break;
 	case SIOCSIFMEDIA:
 	case SIOCGIFMEDIA:
@@ -962,9 +1034,11 @@ smte_setup_dma(struct smte_softc *sc)
 
 	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), 1, 0,
 	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
-	    MCLBYTES, 1, MCLBYTES, 0, NULL, NULL, &sc->rxbuf_tag);
+	    MJUMPAGESIZE, 1, MJUMPAGESIZE, 0, NULL, NULL, &sc->rxbuf_tag);
 	if (error != 0)
 		return (error);
+
+	sc->rx_bufsize = smte_rx_bufsize(ETHERMTU);
 
 	for (i = 0; i < SMTE_NTXDESC; i++) {
 		error = bus_dmamap_create(sc->txbuf_tag, 0,
