@@ -100,8 +100,11 @@
 CTASSERT(MJUMPAGESIZE - ETHER_ALIGN <= RX_DESC1_SIZE1_MASK);
 #define	SMTE_NRXDESC	256
 
-/* Diagnostic candidate: counters are not part of the accepted ABI. */
-#define SMTE_SERVICE_DIAGNOSTICS 1
+/* Optional diagnostic build; production does not read clocks in the fast path. */
+#ifndef SMTE_SERVICE_DIAGNOSTICS
+#define SMTE_SERVICE_DIAGNOSTICS 0
+#endif
+#define SMTE_SERVICE_NOW() (SMTE_SERVICE_DIAGNOSTICS ? sbinuptime() : 0)
 #define SMTE_DMA_MISSED_FRAME_COUNTER 0x0024
 
 enum smte_service_stat {
@@ -221,6 +224,7 @@ static void smte_tick(void *arg);
 static void
 smte_service_time(struct smte_softc *sc, int total, int peak, sbintime_t start)
 {
+#if SMTE_SERVICE_DIAGNOSTICS
 	uint64_t elapsed;
 
 	SMTE_ASSERT_LOCKED(sc);
@@ -228,6 +232,12 @@ smte_service_time(struct smte_softc *sc, int total, int peak, sbintime_t start)
 	sc->service[total] += elapsed;
 	if (elapsed > sc->service[peak])
 		sc->service[peak] = elapsed;
+#else
+	(void)sc;
+	(void)total;
+	(void)peak;
+	(void)start;
+#endif
 }
 
 static void
@@ -319,9 +329,12 @@ smte_service_sysctls(struct smte_softc *sc)
 	tree = SYSCTL_ADD_NODE(ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
 	    "service", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
-	    "Experimental SMTE service diagnostics");
+	    "SMTE service counters; timing requires a diagnostic build");
 	if (tree == NULL)
 		return;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "timing_enabled", CTLFLAG_RD, NULL, SMTE_SERVICE_DIAGNOSTICS,
+	    "Fast-path clock sampling compiled in");
 	for (i = 0; i < SMTE_STAT_COUNT; i++)
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, names[i],
 		    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, i,
@@ -332,6 +345,25 @@ smte_service_sysctls(struct smte_softc *sc)
 	    "Opt-in TX reclaim before RX delivery (default 0)");
 }
 
+
+/* Device-scoped boot policy. Invalid feature values fail closed. */
+static int
+smte_boot_flag(struct smte_softc *sc, const char *feature)
+{
+	char name[64];
+	int requested;
+
+	requested = 0;
+	snprintf(name, sizeof(name), "hw.smte.%d.%s",
+	    device_get_unit(sc->dev), feature);
+	TUNABLE_INT_FETCH(name, &requested);
+	if (requested != 0 && requested != 1) {
+		device_printf(sc->dev, "invalid %s value %d; disabled\n",
+		    feature, requested);
+		return (0);
+	}
+	return (requested);
+}
 
 /* Packet queue capacity is independent of the number of DMA descriptors.
  * Keep the existing default until the larger bounded queue passes hardware
@@ -848,7 +880,7 @@ smte_rxeof(struct smte_softc *sc)
 	SMTE_ASSERT_LOCKED(sc);
 
 	sc->service[SMTE_STAT_RX_CALLS]++;
-	phase_start = sbinuptime();
+	phase_start = SMTE_SERVICE_NOW();
 	mbufq_init(&mq, SMTE_NRXDESC);
 
 	/*
@@ -912,7 +944,7 @@ smte_rxeof(struct smte_softc *sc)
 
 	/* Hand the batch to the stack without holding our lock. */
 	if (mbufq_len(&mq) > 0) {
-		phase_start = sbinuptime();
+		phase_start = SMTE_SERVICE_NOW();
 #ifdef INET
 		use_lro = sc->sw_lro && sc->sw_lro_ready;
 #endif
@@ -1094,7 +1126,7 @@ smte_txeof(struct smte_softc *sc)
 	sbintime_t start;
 
 	SMTE_ASSERT_LOCKED(sc);
-	start = sbinuptime();
+	start = SMTE_SERVICE_NOW();
 
 	bus_dmamap_sync(sc->desc_tag, sc->txdesc_map,
 	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
@@ -1202,7 +1234,7 @@ smte_intr(void *arg)
 	sbintime_t start;
 
 	sc = arg;
-	start = sbinuptime();
+	start = SMTE_SERVICE_NOW();
 	SMTE_LOCK(sc);
 	smte_service_time(sc, SMTE_STAT_INTR_LOCK_WAIT_NS,
 	    SMTE_STAT_INTR_LOCK_WAIT_MAX_NS, start);
@@ -1910,6 +1942,7 @@ smte_attach(device_t dev)
 	if_setioctlfn(sc->ifp, smte_ioctl);
 	if_setinitfn(sc->ifp, smte_init);
 	smte_tx_queue_setup(sc);
+	sc->tx_pack = smte_boot_flag(sc, "tx_pack");
 	if_setsendqready(sc->ifp);
 	if_setcapabilities(sc->ifp, IFCAP_VLAN_MTU);
 	if_setcapenable(sc->ifp, if_getcapabilities(sc->ifp));
@@ -1934,9 +1967,10 @@ smte_attach(device_t dev)
 #ifdef INET
 	/* Detach returns EBUSY; state lives for this device's whole boot. */
 	error = tcp_lro_init_args(&sc->sw_lro_ctrl, sc->ifp, 16, 0);
-	if (error == 0)
+	if (error == 0) {
 		sc->sw_lro_ready = 1;
-	else
+		sc->sw_lro = smte_boot_flag(sc, "sw_lro");
+	} else
 		device_printf(dev, "software LRO unavailable: %d\n", error);
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
