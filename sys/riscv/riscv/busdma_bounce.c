@@ -80,6 +80,12 @@ struct bus_dma_tag {
 static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Busdma parameters");
 
+/* Experimental RV2 ordering comparison; not an accepted platform quirk. */
+static int nvme_postread_fence = 1;
+SYSCTL_INT(_hw_busdma, OID_AUTO, nvme_postread_fence, CTLFLAG_RWTUN,
+    &nvme_postread_fence, 0,
+    "Fence noncoherent offset-preserving bounce reads before copying");
+
 struct sync_list {
 	char		*vaddr;		/* kva of client data */
 	bus_addr_t	paddr;		/* physical address */
@@ -951,9 +957,20 @@ bounce_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
 
 		if ((op & BUS_DMASYNC_POSTREAD) != 0) {
 			while (bpage != NULL) {
-				if ((dmat->bounce_flags & BF_COHERENT) == 0)
+				if ((dmat->bounce_flags & BF_COHERENT) == 0) {
 					cpu_dcache_inv_range(bpage->vaddr,
 					    bpage->datacount);
+					/*
+					 * RV2 tracing found stale initial loads in a
+					 * backwards page copy after invalidation.
+					 * Compare an explicit barrier with the ISA's
+					 * normal overlapping-address CBO ordering.
+					 */
+					if (nvme_postread_fence != 0 &&
+					    (dmat->common.flags &
+					    BUS_DMA_KEEP_PG_OFFSET) != 0)
+						fence();
+				}
 				tempvaddr = NULL;
 				datavaddr = bpage->datavaddr;
 				if (datavaddr == NULL) {
