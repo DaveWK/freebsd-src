@@ -1710,8 +1710,11 @@ sdma_default:
 	 * and sequential reads gain about 6 percent over the SDMA bounce
 	 * buffer.  The SDIO slot is deliberately left on SDMA: it is the one
 	 * with the troubled history here and nothing has been measured on it.
+	 * Removable SD slots (the RV2's microSD boot card) stay on SDMA too:
+	 * ADMA2 has only been measured on the non-removable eMMC.
 	 */
-	if (!((struct sdhci_fdt_spacemit_softc *)sc)->sdio_slot)
+	if (((struct sdhci_fdt_spacemit_softc *)sc)->non_removable &&
+	    !((struct sdhci_fdt_spacemit_softc *)sc)->sdio_slot)
 		sc->quirks2 |= SDHCI_QUIRK2_USE_ADMA2;
 
 	error = sdhci_fdt_attach(dev);
