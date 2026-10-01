@@ -206,6 +206,31 @@ nvme_completion_is_retry(const struct nvme_completion *cpl)
 	}
 }
 
+static bus_dmasync_op_t
+nvme_payload_sync_op(const struct nvme_qpair *qpair,
+    const struct nvme_request *req, bool before)
+{
+
+	/*
+	 * Ordinary I/O transfers data in one direction.  Synchronizing both
+	 * directions also copies bounced buffers both ways, wasting memory
+	 * bandwidth and CPU time.  Keep the conservative behavior for admin
+	 * and other I/O commands, whose payload semantics are not decoded here.
+	 */
+	if (qpair->id != 0) {
+		switch (req->cmd.opc) {
+		case NVME_OPC_READ:
+			return (before ? BUS_DMASYNC_PREREAD :
+			    BUS_DMASYNC_POSTREAD);
+		case NVME_OPC_WRITE:
+			return (before ? BUS_DMASYNC_PREWRITE :
+			    BUS_DMASYNC_POSTWRITE);
+		}
+	}
+	return (before ? BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE :
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+}
+
 static void
 nvme_qpair_complete_tracker(struct nvme_tracker *tr,
     struct nvme_completion *cpl, error_print_t print_on_error)
@@ -239,7 +264,7 @@ nvme_qpair_complete_tracker(struct nvme_tracker *tr,
 		if (req->payload_valid) {
 			bus_dmamap_sync(qpair->dma_tag_payload,
 			    tr->payload_dma_map,
-			    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+			    nvme_payload_sync_op(qpair, req, false));
 		}
 		if (req->cb_fn)
 			req->cb_fn(req->cb_arg, cpl);
@@ -1122,7 +1147,7 @@ nvme_payload_map(void *arg, bus_dma_segment_t *seg, int nseg, int error)
 	}
 
 	bus_dmamap_sync(tr->qpair->dma_tag_payload, tr->payload_dma_map,
-	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+	    nvme_payload_sync_op(qpair, tr->req, true));
 	nvme_qpair_submit_tracker(tr->qpair, tr);
 }
 
