@@ -360,6 +360,16 @@ ENTRY(cpu_switch)
 	beq	t0, s2, 1b
 #endif
 
+	/*
+	 * The old thread may now run on another CPU.  Stop using its stack
+	 * before calling C code: vector_state_restore() saves ra and s0 on
+	 * the stack even though the incoming register context is not loaded
+	 * yet.  The incoming thread has released TD_LOCK, so its saved stack
+	 * is now exclusively ours.  Reload the PCB after the call below.
+	 */
+	ld	x13, TD_PCB(a1)
+	ld	sp, (PCB_SP)(x13)
+
 	/* Is VS enabled for new thread? */
 	ld	t0, TD_FRAME(a1)
 	ld	t1, (TF_SSTATUS)(t0)
