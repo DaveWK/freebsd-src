@@ -751,6 +751,7 @@ spacemit_pcie_get_dma_tag(device_t dev, device_t child __unused)
 static device_method_t spacemit_pcie_methods[] = {
 	DEVMETHOD(device_probe,		spacemit_pcie_probe),
 	DEVMETHOD(device_attach,	spacemit_pcie_attach),
+	DEVMETHOD(device_shutdown,	bus_generic_shutdown),
 
 	DEVMETHOD(pci_dw_get_link,	spacemit_pcie_get_link),
 	DEVMETHOD(bus_get_dma_tag,	spacemit_pcie_get_dma_tag),
