@@ -930,9 +930,15 @@ bounce_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
 			}
 			dmat->bounce_zone->total_bounced++;
 		} else if ((op & BUS_DMASYNC_PREREAD) != 0) {
+			/*
+			 * Clean dirty data before giving the device ownership.
+			 * The private bounce pages are not accessed by the CPU
+			 * until POSTREAD invalidates them after DMA completion,
+			 * so invalidating them here as well is unnecessary.
+			 */
 			while (bpage != NULL) {
 				if ((dmat->bounce_flags & BF_COHERENT) == 0)
-					cpu_dcache_wbinv_range(bpage->vaddr,
+					cpu_dcache_wb_range(bpage->vaddr,
 					    bpage->datacount);
 				bpage = STAILQ_NEXT(bpage, links);
 			}
