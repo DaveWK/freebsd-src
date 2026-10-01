@@ -549,12 +549,17 @@ nvme_qpair_construct(struct nvme_qpair *qpair,
 	qpair->timer_armed = false;
 	qpair->recovery_state = RECOVERY_WAITING;
 
-	/* Note: NVMe PRP format is restricted to 4-byte alignment. */
+	/*
+	 * NVMe PRPs require 4-byte alignment and encode the first segment's
+	 * length through its offset within a controller page.  Preserve that
+	 * offset when busdma bounces a partial page; otherwise the controller
+	 * consumes bytes beyond that segment instead of advancing to PRP2.
+	 */
 	err = bus_dma_tag_create(bus_get_dma_tag(ctrlr->dev),
 	    4, ctrlr->page_size, BUS_SPACE_MAXADDR,
 	    BUS_SPACE_MAXADDR, NULL, NULL, ctrlr->max_xfer_size,
 	    howmany(ctrlr->max_xfer_size, ctrlr->page_size) + 1,
-	    ctrlr->page_size, 0,
+	    ctrlr->page_size, BUS_DMA_KEEP_PG_OFFSET,
 	    NULL, NULL, &qpair->dma_tag_payload);
 	if (err != 0) {
 		nvme_printf(ctrlr, "payload tag create failed %d\n", err);
