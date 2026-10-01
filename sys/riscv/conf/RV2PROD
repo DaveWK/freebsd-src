@@ -1,5 +1,5 @@
 include RV2
-ident		RV2WORKER
+ident		RV2PROD
 
 nooptions	WITNESS
 nooptions	WITNESS_SKIPSPIN
