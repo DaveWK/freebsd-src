@@ -592,8 +592,11 @@ _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
 			else
 				paddr = pmap_extract(pmap, vaddr);
 			if (must_bounce(dmat, map, paddr, sg_len)) {
-				sg_len = roundup2(sg_len,
-				    dmat->common.alignment);
+				/* A retained offset leaves only the page remainder. */
+				if ((dmat->common.flags & BUS_DMA_KEEP_PG_OFFSET)
+				    == 0)
+					sg_len = roundup2(sg_len,
+					    dmat->common.alignment);
 				map->pagesneeded++;
 			}
 			vaddr += sg_len;
@@ -728,7 +731,9 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 		sgsize = MIN(buflen, PAGE_SIZE - (curaddr & PAGE_MASK));
 		if (map->pagesneeded != 0 &&
 		    must_bounce(dmat, map, curaddr, sgsize)) {
-			sgsize = roundup2(sgsize, dmat->common.alignment);
+			/* Match the page-bounded count when retaining offsets. */
+			if ((dmat->common.flags & BUS_DMA_KEEP_PG_OFFSET) == 0)
+				sgsize = roundup2(sgsize, dmat->common.alignment);
 			sgsize = MIN(sgsize, buflen);
 			curaddr = add_bounce_page(dmat, map, kvaddr, curaddr,
 			    sgsize);
