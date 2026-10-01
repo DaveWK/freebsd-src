@@ -153,6 +153,7 @@ struct spacemit_pcie_softc {
 	struct spacemit_pcie_irqsrc *isrcs;
 	void			*msi_page;
 	bus_addr_t		msi_target;
+	bus_dma_tag_t		dma_tag;
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -453,6 +454,26 @@ spacemit_pcie_attach(device_t dev)
 	if (error != 0)
 		return (error);
 
+	/*
+	 * K1 PCIe has only a 2-GiB identity DMA window.  The parent bus's
+	 * dma-ranges maps its upper window to different CPU addresses, and
+	 * RISC-V busdma does not implement that translation yet.  Passing
+	 * high physical addresses to an endpoint silently targets the wrong
+	 * memory, including when busdma itself allocates a high bounce page.
+	 * Constrain all descendant tags (payloads, queues and PRP lists) to
+	 * the identity window until upper-window translation is supported.
+	 */
+	error = bus_dma_tag_create(sc->dw_sc.dmat, 1, 0,
+	    0x7fffffffULL, BUS_SPACE_MAXADDR, NULL, NULL,
+	    BUS_SPACE_MAXSIZE, BUS_SPACE_UNRESTRICTED, BUS_SPACE_MAXSIZE,
+	    0, NULL, NULL, &sc->dma_tag);
+	if (error != 0) {
+		device_printf(dev, "cannot create reachable DMA tag (%d)\n",
+		    error);
+		return (error);
+	}
+	device_printf(dev, "DMA restricted to identity window below 2 GiB\n");
+
 	/* Stand up the DWC integrated MSI controller before children attach. */
 	error = spacemit_pcie_msi_attach(sc);
 	if (error != 0)
@@ -718,11 +739,21 @@ spacemit_pcie_msi_attach(struct spacemit_pcie_softc *sc)
 }
 /* ---- end MSI controller ---- */
 
+static bus_dma_tag_t
+spacemit_pcie_get_dma_tag(device_t dev, device_t child __unused)
+{
+	struct spacemit_pcie_softc *sc;
+
+	sc = device_get_softc(dev);
+	return (sc->dma_tag);
+}
+
 static device_method_t spacemit_pcie_methods[] = {
 	DEVMETHOD(device_probe,		spacemit_pcie_probe),
 	DEVMETHOD(device_attach,	spacemit_pcie_attach),
 
 	DEVMETHOD(pci_dw_get_link,	spacemit_pcie_get_link),
+	DEVMETHOD(bus_get_dma_tag,	spacemit_pcie_get_dma_tag),
 
 	/* MSI controller: override pci_dw's msimap-based versions with ours. */
 	DEVMETHOD(pcib_alloc_msi,	spacemit_pcie_alloc_msi),
