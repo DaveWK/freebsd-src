@@ -327,6 +327,73 @@ spacemit_pcie_probe(device_t dev)
 
 static int spacemit_pcie_msi_attach(struct spacemit_pcie_softc *sc);
 
+/*
+ * Register the parent bus's dma-ranges as busdma translation windows, so
+ * memory above the 2 GiB identity window that a range covers is reached
+ * directly instead of through bounce pages.  Returns the windows added.
+ */
+static int
+spacemit_pcie_dma_windows(struct spacemit_pcie_softc *sc)
+{
+	phandle_t bus, node;
+	pcell_t *cells;
+	ssize_t len;
+	int acells, pacells, scells, entry, i, n, error;
+	uint64_t addr[3];
+
+	node = ofw_bus_get_node(sc->dev);
+	bus = OF_parent(node);
+	if (bus == 0 || OF_parent(bus) == 0)
+		return (0);
+	if (OF_getencprop(bus, "#address-cells", &acells,
+	    sizeof(acells)) <= 0)
+		acells = 2;
+	if (OF_getencprop(bus, "#size-cells", &scells, sizeof(scells)) <= 0)
+		scells = 1;
+	if (OF_getencprop(OF_parent(bus), "#address-cells", &pacells,
+	    sizeof(pacells)) <= 0)
+		pacells = 2;
+	if (acells < 1 || acells > 2 || pacells < 1 || pacells > 2 ||
+	    scells < 1 || scells > 2)
+		return (0);
+	len = OF_getencprop_alloc_multi(bus, "dma-ranges", sizeof(pcell_t),
+	    (void **)&cells);
+	if (len <= 0)
+		return (0);
+	entry = acells + pacells + scells;
+	n = 0;
+	for (i = 0; i + entry <= len; i += entry) {
+		addr[0] = cells[i];
+		if (acells == 2)
+			addr[0] = (addr[0] << 32) | cells[i + 1];
+		addr[1] = cells[i + acells];
+		if (pacells == 2)
+			addr[1] = (addr[1] << 32) | cells[i + acells + 1];
+		addr[2] = cells[i + acells + pacells];
+		if (scells == 2)
+			addr[2] = (addr[2] << 32) |
+			    cells[i + acells + pacells + 1];
+		/* bus address addr[0] reaches CPU physical addr[1]. */
+		error = bus_dma_tag_add_window(sc->dma_tag, addr[1], addr[2],
+		    addr[0]);
+		if (error != 0) {
+			device_printf(sc->dev,
+			    "cannot add DMA window %#jx-%#jx (%d)\n",
+			    (uintmax_t)addr[1], (uintmax_t)(addr[1] + addr[2] - 1),
+			    error);
+			continue;
+		}
+		if (bootverbose || addr[0] != addr[1])
+			device_printf(sc->dev,
+			    "DMA window: CPU %#jx-%#jx at bus %#jx\n",
+			    (uintmax_t)addr[1],
+			    (uintmax_t)(addr[1] + addr[2] - 1), (uintmax_t)addr[0]);
+		n++;
+	}
+	OF_prop_free(cells);
+	return (n);
+}
+
 static int
 spacemit_pcie_attach(device_t dev)
 {
@@ -336,7 +403,7 @@ spacemit_pcie_attach(device_t dev)
 	pcell_t apmu_prop[2];
 	phandle_t node;
 	bool linkup;
-	int rid, error;
+	int rid, error, dma_windows;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
@@ -455,13 +522,14 @@ spacemit_pcie_attach(device_t dev)
 		return (error);
 
 	/*
-	 * K1 PCIe has only a 2-GiB identity DMA window.  The parent bus's
-	 * dma-ranges maps its upper window to different CPU addresses, and
-	 * RISC-V busdma does not implement that translation yet.  Passing
-	 * high physical addresses to an endpoint silently targets the wrong
-	 * memory, including when busdma itself allocates a high bounce page.
-	 * Constrain all descendant tags (payloads, queues and PRP lists) to
-	 * the identity window until upper-window translation is supported.
+	 * K1 PCIe has a 2-GiB identity DMA window; the parent bus's
+	 * dma-ranges maps an upper window to different CPU addresses.  Passing
+	 * an untranslated high physical address to an endpoint silently
+	 * targets the wrong memory, including a high bounce page.  Constrain
+	 * all descendant tags (payloads, queues and PRP lists) to the identity
+	 * window, then register the dma-ranges as translation windows so the
+	 * memory they cover is reached directly; the rest still bounces.
+	 * hw.spacemit_pcie.dma_windows=0 keeps every high address bouncing.
 	 */
 	error = bus_dma_tag_create(sc->dw_sc.dmat, 1, 0,
 	    0x7fffffffULL, BUS_SPACE_MAXADDR, NULL, NULL,
@@ -472,7 +540,11 @@ spacemit_pcie_attach(device_t dev)
 		    error);
 		return (error);
 	}
-	device_printf(dev, "DMA restricted to identity window below 2 GiB\n");
+	dma_windows = 1;
+	TUNABLE_INT_FETCH("hw.spacemit_pcie.dma_windows", &dma_windows);
+	if (dma_windows == 0 || spacemit_pcie_dma_windows(sc) == 0)
+		device_printf(dev,
+		    "DMA restricted to identity window below 2 GiB\n");
 
 	/* Stand up the DWC integrated MSI controller before children attach. */
 	error = spacemit_pcie_msi_attach(sc);

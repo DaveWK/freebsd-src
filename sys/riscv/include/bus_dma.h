@@ -8,6 +8,14 @@
 #include <machine/bus_dma_impl.h>
 
 /*
+ * Make CPU physical [cpu_start, cpu_start + size) reachable by the devices
+ * under dmat at bus address bus_start (a dma-ranges translation).  Tags
+ * created from dmat afterwards inherit the window.
+ */
+int bus_dma_tag_add_window(bus_dma_tag_t dmat, bus_addr_t cpu_start,
+    bus_size_t size, bus_addr_t bus_start);
+
+/*
  * Allocate a handle for mapping from kva/uva/physical
  * address space into bus device space.
  */
