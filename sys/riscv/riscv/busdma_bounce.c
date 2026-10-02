@@ -69,12 +69,27 @@ enum {
 struct bounce_page;
 struct bounce_zone;
 
+/*
+ * A translation window: CPU physical [cpu_start, cpu_end] appears to the
+ * devices under a tag at bus_start.  Addresses inside a window need no
+ * bounce even when lowaddr excludes them; segments carry the bus address.
+ */
+#define	BUS_DMA_MAX_WINDOWS	4
+
+struct bus_dma_window {
+	bus_addr_t		cpu_start;
+	bus_addr_t		cpu_end;
+	bus_addr_t		bus_start;
+};
+
 struct bus_dma_tag {
 	struct bus_dma_tag_common common;
 	int			map_count;
 	int			bounce_flags;
 	bus_dma_segment_t	*segments;
 	struct bounce_zone	*bounce_zone;
+	u_int			nwindows;
+	struct bus_dma_window	windows[BUS_DMA_MAX_WINDOWS];
 };
 
 static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
@@ -165,6 +180,11 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 
 		/* Copy some flags from the parent */
 		newtag->bounce_flags |= parent->bounce_flags & BF_COHERENT;
+
+		/* Children see memory through the same windows. */
+		newtag->nwindows = parent->nwindows;
+		memcpy(newtag->windows, parent->windows,
+		    sizeof(newtag->windows));
 	}
 
 	/*
@@ -528,6 +548,38 @@ cacheline_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
 	return (((paddr | size) & (dcache_line_size - 1)) != 0);
 }
 
+/*
+ * Return the translation window holding all of [paddr, paddr + size), if any.
+ */
+static const struct bus_dma_window *
+dma_window(bus_dma_tag_t dmat, bus_addr_t paddr, bus_size_t size)
+{
+	const struct bus_dma_window *w;
+	u_int i;
+
+	for (i = 0; i < dmat->nwindows; i++) {
+		w = &dmat->windows[i];
+		if (paddr >= w->cpu_start && paddr <= w->cpu_end &&
+		    size - 1 <= w->cpu_end - paddr)
+			return (w);
+	}
+	return (NULL);
+}
+
+/*
+ * The address a device uses for CPU physical address paddr.
+ */
+static bus_addr_t
+dma_bus_addr(bus_dma_tag_t dmat, bus_addr_t paddr)
+{
+	const struct bus_dma_window *w;
+
+	w = dma_window(dmat, paddr, 1);
+	if (w == NULL)
+		return (paddr);
+	return (paddr - w->cpu_start + w->bus_start);
+}
+
 static bool
 must_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
     bus_size_t size)
@@ -535,9 +587,38 @@ must_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
 	if (cacheline_bounce(dmat, map, paddr, size))
 		return (true);
 	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0 &&
-	    addr_needs_bounce(dmat, paddr))
+	    addr_needs_bounce(dmat, paddr)) {
+		/* A translation window makes an excluded range reachable. */
+		if (vm_addr_align_ok(paddr, dmat_alignment(dmat)) &&
+		    dma_window(dmat, paddr, size) != NULL)
+			return (false);
 		return (true);
+	}
 	return (false);
+}
+
+/*
+ * Let the devices under dmat, and tags created from it afterwards, reach CPU
+ * physical [cpu_start, cpu_start + size) at bus address bus_start, as a
+ * parent bus's dma-ranges describes.
+ */
+int
+bus_dma_tag_add_window(bus_dma_tag_t dmat, bus_addr_t cpu_start,
+    bus_size_t size, bus_addr_t bus_start)
+{
+	struct bus_dma_window *w;
+
+	if (dmat->common.impl != &bus_dma_bounce_impl || size == 0 ||
+	    cpu_start + (size - 1) < cpu_start ||
+	    bus_start + (size - 1) < bus_start)
+		return (EINVAL);
+	if (dmat->nwindows == BUS_DMA_MAX_WINDOWS)
+		return (ENOSPC);
+	w = &dmat->windows[dmat->nwindows++];
+	w->cpu_start = cpu_start;
+	w->cpu_end = cpu_start + (size - 1);
+	w->bus_start = bus_start;
+	return (0);
 }
 
 static void
@@ -667,8 +748,8 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 			} else
 				sl->datacount += sgsize;
 		}
-		if (!_bus_dmamap_addsegs(dmat, map, curaddr, sgsize, segs,
-		    segp))
+		if (!_bus_dmamap_addsegs(dmat, map, dma_bus_addr(dmat, curaddr),
+		    sgsize, segs, segp))
 			break;
 		buf += sgsize;
 		buflen -= sgsize;
@@ -771,8 +852,8 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 			} else
 				sl->datacount += sgsize;
 		}
-		if (!_bus_dmamap_addsegs(dmat, map, curaddr, sgsize, segs,
-		    segp))
+		if (!_bus_dmamap_addsegs(dmat, map, dma_bus_addr(dmat, curaddr),
+		    sgsize, segs, segp))
 			break;
 		vaddr += sgsize;
 		buflen -= MIN(sgsize, buflen); /* avoid underflow */
