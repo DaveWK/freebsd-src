@@ -579,13 +579,15 @@ nvme_qpair_construct(struct nvme_qpair *qpair,
 	 * length through its offset within a controller page.  Preserve that
 	 * offset when busdma bounces a partial page; otherwise the controller
 	 * consumes bytes beyond that segment instead of advancing to PRP2.
+	 * A load may wait for bounce pages; busdma then calls nvme_payload_map
+	 * later with the qpair lock held, as when it is called directly.
 	 */
 	err = bus_dma_tag_create(bus_get_dma_tag(ctrlr->dev),
 	    4, ctrlr->page_size, BUS_SPACE_MAXADDR,
 	    BUS_SPACE_MAXADDR, NULL, NULL, ctrlr->max_xfer_size,
 	    howmany(ctrlr->max_xfer_size, ctrlr->page_size) + 1,
 	    ctrlr->page_size, BUS_DMA_KEEP_PG_OFFSET,
-	    NULL, NULL, &qpair->dma_tag_payload);
+	    busdma_lock_mutex, &qpair->lock, &qpair->dma_tag_payload);
 	if (err != 0) {
 		nvme_printf(ctrlr, "payload tag create failed %d\n", err);
 		goto out;
@@ -1211,8 +1213,7 @@ _nvme_qpair_submit_request(struct nvme_qpair *qpair, struct nvme_request *req)
 	 * when there's no map to load).
 	 */
 	(void)bus_dmamap_load_mem(tr->qpair->dma_tag_payload,
-	    tr->payload_dma_map, &req->payload, nvme_payload_map, tr,
-	    BUS_DMA_NOWAIT);
+	    tr->payload_dma_map, &req->payload, nvme_payload_map, tr, 0);
 }
 
 void
