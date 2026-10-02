@@ -31,7 +31,7 @@
 .\"
 .\" Author: Jim Harris <jimharris@FreeBSD.org>
 .\"
-.Dd August 27, 2026
+.Dd October 1, 2026
 .Dt NVME 4
 .Os
 .Sh NAME
@@ -51,6 +51,7 @@ In
 .Cd hw.nvme.apst_enable= Ns Ar 1
 .Cd hw.nvme.apst_data
 .Cd hw.nvme.use_nvd= Ns Ar 0
+.Cd hw.nvme.honor_maxcmd= Ns Ar 0
 .Cd nvme_load="YES"
 .Pp
 In
@@ -189,6 +190,20 @@ driver can also be used instead.
 .Pp
 This value may also be set in the kernel config file with
 .Cd options NVME_USE_NVD=0 .
+.It Va hw.nvme.honor_maxcmd=0
+By default,
+.Nm
+allocates no more trackers per I/O queue than the Maximum Outstanding
+Commands
+.Pq MAXCMD
+value the controller reports in its Identify data.
+The specification lets the host use MAXCMD to size its queues but does not
+require it, and some controllers report a value far below the depth they
+sustain.
+Setting this to 0 ignores MAXCMD, so the number of trackers is limited only
+by
+.Va hw.nvme.io_trackers
+and the queue size.
 .It Va hw.nvme.verbose_cmd_dump=1
 Enable verbose error messages.
 When there is an error,
