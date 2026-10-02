@@ -693,6 +693,20 @@ _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
 }
 
 /*
+ * A deferred load (EINPROGRESS) is restarted from the beginning once bounce
+ * pages are free, so it may only wait before it has built any segment, sync
+ * entry or bounce page.  Once a multi-call load (page or vector lists, uio)
+ * has added a segment (*segp >= 0), a reservation that cannot be met fails
+ * with ENOMEM instead of leaving partial state for the restart to append to.
+ */
+static int
+reserve_flags(int *segp, int flags)
+{
+
+	return (*segp >= 0 ? flags | BUS_DMA_NOWAIT : flags);
+}
+
+/*
  * Utility function to load a physical buffer.  segp contains
  * the starting segment on entrace, and the ending segment on exit.
  */
@@ -712,7 +726,8 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) {
 		_bus_dmamap_count_phys(dmat, map, buf, buflen, flags);
 		if (map->pagesneeded != 0) {
-			error = _bus_dmamap_reserve_pages(dmat, map, flags);
+			error = _bus_dmamap_reserve_pages(dmat, map,
+			    reserve_flags(segp, flags));
 			if (error)
 				return (error);
 		}
@@ -789,7 +804,8 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) {
 		_bus_dmamap_count_pages(dmat, map, pmap, buf, buflen, flags);
 		if (map->pagesneeded != 0) {
-			error = _bus_dmamap_reserve_pages(dmat, map, flags);
+			error = _bus_dmamap_reserve_pages(dmat, map,
+			    reserve_flags(segp, flags));
 			if (error)
 				return (error);
 		}
@@ -868,6 +884,44 @@ cleanup:
 		return (EFBIG);
 	}
 	return (0);
+}
+
+/*
+ * Load a list of pages.  bus_dmamap_load_ma_triv() loads them one at a time,
+ * which would count and reserve bounce pages one page at a time and so could
+ * need to wait partway through.  Count and reserve for the whole list first,
+ * so that a load that must wait does so before it builds anything; the
+ * per-page loads then find their pages already reserved.
+ */
+static int
+bounce_bus_dmamap_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
+    struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
+    bus_dma_segment_t *segs, int *segp)
+{
+	vm_paddr_t paddr;
+	bus_size_t len, left;
+	int error, i, offs;
+
+	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0 &&
+	    (map->flags & DMAMAP_COULD_BOUNCE) != 0 && map->pagesneeded == 0) {
+		offs = ma_offs;
+		for (i = 0, left = tlen; left > 0; i++, left -= len) {
+			len = MIN(PAGE_SIZE - offs, left);
+			paddr = VM_PAGE_TO_PHYS(ma[i]) + offs;
+			/* load_phys bounces each page-bounded chunk in one page. */
+			if (must_bounce(dmat, map, paddr, len))
+				map->pagesneeded++;
+			offs = 0;
+		}
+		if (map->pagesneeded != 0) {
+			error = _bus_dmamap_reserve_pages(dmat, map,
+			    reserve_flags(segp, flags));
+			if (error != 0)
+				return (error);
+		}
+	}
+	return (bus_dmamap_load_ma_triv(dmat, map, ma, tlen, ma_offs, flags,
+	    segs, segp));
 }
 
 static void
@@ -1100,7 +1154,7 @@ struct bus_dma_impl bus_dma_bounce_impl = {
 	.mem_free = bounce_bus_dmamem_free,
 	.load_phys = bounce_bus_dmamap_load_phys,
 	.load_buffer = bounce_bus_dmamap_load_buffer,
-	.load_ma = bus_dmamap_load_ma_triv,
+	.load_ma = bounce_bus_dmamap_load_ma,
 	.map_waitok = bounce_bus_dmamap_waitok,
 	.map_complete = bounce_bus_dmamap_complete,
 	.map_unload = bounce_bus_dmamap_unload,
