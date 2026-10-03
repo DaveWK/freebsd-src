@@ -459,13 +459,13 @@ do_trap_user(struct trapframe *frame)
 			if ((pcb->pcb_vsflags & PCB_VS_STARTED) == 0) {
 				vector_state_init(td);
 				pcb->pcb_vsflags |= PCB_VS_STARTED;
-			} else {
-				critical_enter();
-				vector_state_restore(td);
-				critical_exit();
 			}
+			/* Load the fresh or restored context before enabling user VS. */
+			critical_enter();
+			vector_state_restore(td);
 			frame->tf_sstatus &= ~SSTATUS_VS_MASK;
 			frame->tf_sstatus |= SSTATUS_VS_CLEAN;
+			critical_exit();
 			break;
 		}
 		call_trapsignal(td, SIGILL, ILL_ILLTRP, (void *)frame->tf_sepc,
