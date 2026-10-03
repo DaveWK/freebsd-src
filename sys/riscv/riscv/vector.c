@@ -197,6 +197,10 @@ vector_state_init(struct thread *td)
 	len = vector_get_size();
 
 	p->pcb_vsaved = malloc(len, M_RVV_CTX, M_WAITOK | M_ZERO);
+	p->pcb_vstart = 0;
+	p->pcb_vtype = 0;
+	p->pcb_vl = 0;
+	p->pcb_vcsr = 0;
 }
 
 void
@@ -217,6 +221,10 @@ vector_copy_thread(struct thread *td1, struct thread *td2)
 	len = vector_get_size();
 
 	memcpy(p2->pcb_vsaved, p1->pcb_vsaved, len);
+	p2->pcb_vstart = p1->pcb_vstart;
+	p2->pcb_vtype = p1->pcb_vtype;
+	p2->pcb_vl = p1->pcb_vl;
+	p2->pcb_vcsr = p1->pcb_vcsr;
 }
 
 /*
