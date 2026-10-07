@@ -2,10 +2,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Copyright (c) 2026 Daniel Shue <dgshue@gmail.com>
+ * Copyright (c) 2026 Dave Klotz <DaveWK225@protonmail.com>
  *
  * Thermal sensor driver for the SpacemiT K1 (Ky X1) RISC-V SoC
- * (compatible: spacemit,k1-tsensor).  Exposes the on-die temperature via
- * a sysctl (dev.spacemit_tsensor.<unit>.temperature, in 0.1 Kelvin).
+ * (compatible: spacemit,k1-tsensor).  The block has five sensors (the
+ * "#thermal-sensor-cells = <1>" index): 0 soc, 1 package, 2 gpu, 3 cpu
+ * cluster 0 and 4 cpu cluster 1.  Each is exposed via sysctl in 0.1 Kelvin
+ * (dev.spacemit_tsensor.<unit>.temperature remains sensor 0).
  * Register layout and conversion from the mainline Linux driver
  * (drivers/thermal/spacemit/k1_tsensor.c).
  */
@@ -40,10 +43,23 @@
 #define	 TSEN_TIME_FILTER_PER	(0x3u << 20)
 #define	 TSEN_TIME_MASK		(0xffffffu << 0)
 #define	TSEN_INT_EN		0x14
-#define	TSEN_DATA0		0x20
-#define	 TSEN_DATA_LOW_MASK	0xffff
+#define	TSEN_DATA(n)		(0x20 + ((n) / 2) * 4)
+#define	 TSEN_DATA_SHIFT(n)	(((n) % 2) * 16)
+#define	 TSEN_DATA_MASK		0xffff
 
+#define	TSEN_NSENSORS		5
 #define	TSEN_TEMP_OFFSET	278	/* raw - 278 = degrees C */
+
+/*
+ * Readings outside this window are treated as "no sample" (an unclocked or
+ * disabled sensor reads 0).
+ */
+#define	TSEN_TEMP_MIN_C		(-40)
+#define	TSEN_TEMP_MAX_C		150
+
+static const char *sptsen_names[TSEN_NSENSORS] = {
+	"soc", "package", "gpu", "cluster0", "cluster1"
+};
 
 struct sptsen_softc {
 	device_t	dev;
@@ -58,25 +74,39 @@ static struct ofw_compat_data compat_data[] = {
 #define	RD4(sc, r)	bus_read_4((sc)->mem_res, (r))
 #define	WR4(sc, r, v)	bus_write_4((sc)->mem_res, (r), (v))
 
+/*
+ * Read sensor 'n' in degrees Celsius.  Returns false when the sensor has
+ * not produced a plausible sample.
+ */
+static bool
+sptsen_read_c(struct sptsen_softc *sc, int n, int *tempc)
+{
+	int val;
+
+	val = (RD4(sc, TSEN_DATA(n)) >> TSEN_DATA_SHIFT(n)) & TSEN_DATA_MASK;
+	if (val == 0)
+		return (false);
+	val -= TSEN_TEMP_OFFSET;
+	if (val < TSEN_TEMP_MIN_C || val > TSEN_TEMP_MAX_C)
+		return (false);
+	*tempc = val;
+	return (true);
+}
+
 static int
 sptsen_temp_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	struct sptsen_softc *sc = arg1;
-	int temp, val;
+	int temp, tempc;
 
-	/* Sensor 0 (primary) is in the low half-word of DATA0. */
-	val = RD4(sc, TSEN_DATA0) & TSEN_DATA_LOW_MASK;
 	/*
-	 * A raw value of 0 means the ADC has not produced a sample (e.g. the
-	 * sensor is held in reset or clock-gated).  Report absolute zero's
-	 * sentinel (0 dK) rather than a nonsensical sub-freezing temperature
-	 * so a monitoring tool can tell "no data" from a real reading.
+	 * Report absolute zero's sentinel (0 dK) when the sensor has no
+	 * sample, so a monitoring tool can tell "no data" from a reading.
 	 */
-	if (val == 0)
-		temp = 0;
+	if (sptsen_read_c(sc, arg2, &tempc))
+		temp = tempc * 10 + 2732;	/* 0.1 Kelvin, IK format */
 	else
-		/* Convert to 0.1 Kelvin for the IK sysctl format. */
-		temp = (val - TSEN_TEMP_OFFSET) * 10 + 2732;
+		temp = 0;
 	return (sysctl_handle_int(oidp, &temp, 0, req));
 }
 
@@ -96,6 +126,8 @@ static int
 sptsen_attach(device_t dev)
 {
 	struct sptsen_softc *sc;
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
 	clk_t clk;
 	hwreset_t rst;
 	uint32_t val;
@@ -114,10 +146,9 @@ sptsen_attach(device_t dev)
 
 	/*
 	 * Deassert the sensor's reset BEFORE touching its registers.  Without
-	 * this the ADC never runs and TSEN_DATA0 reads 0 (the driver then
-	 * reports a nonsensical constant temperature).  Mainline Linux does
-	 * this first in probe (reset_control_get_exclusive_deasserted), so we
-	 * do too.
+	 * this the ADC never runs and the data registers read 0.  Mainline
+	 * Linux does this first in probe (reset_control_get_exclusive_
+	 * deasserted), so we do too.
 	 */
 	if (hwreset_get_by_ofw_idx(dev, 0, 0, &rst) == 0) {
 		if (hwreset_deassert(rst) != 0)
@@ -148,19 +179,29 @@ sptsen_attach(device_t dev)
 	    TSEN_PCTRL_HW_AUTO | TSEN_PCTRL_ENABLE;
 	WR4(sc, TSEN_PCTRL, val);
 
-	/* Enable sensor 0 (primary). */
-	WR4(sc, TSEN_EN, RD4(sc, TSEN_EN) | 0x1);
+	/*
+	 * Enable all five sensors.  The CPU cluster sensors (3, 4) are the
+	 * ones SpacemiT's own kernel uses for its trip points; reading only
+	 * sensor 0 hides the hottest part of the die.
+	 */
+	WR4(sc, TSEN_EN, RD4(sc, TSEN_EN) | ((1u << TSEN_NSENSORS) - 1));
 
 	/*
 	 * Give the hardware auto-mode conversion time to produce a first
-	 * sample before anyone reads DATA0 (a few ADC periods).
+	 * sample before anyone reads the data registers (a few ADC periods).
 	 */
 	DELAY(2000);
 
-	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	ctx = device_get_sysctl_ctx(dev);
+	tree = device_get_sysctl_tree(dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "temperature", CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
-	    sptsen_temp_sysctl, "IK", "SoC temperature");
+	    sptsen_temp_sysctl, "IK", "SoC temperature (sensor 0)");
+	for (i = 0; i < TSEN_NSENSORS; i++) {
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    sptsen_names[i], CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		    sc, i, sptsen_temp_sysctl, "IK", "Sensor temperature");
+	}
 
 	if (bootverbose)
 		device_printf(dev, "temperature reporting enabled\n");
