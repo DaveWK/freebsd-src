@@ -12,8 +12,10 @@ cache directory (default ~/.cache/freebsd-k1-kernels) and built with
 same runner are incremental: git rewrites only the files that changed.
 
 For each configuration OUT/<KERNCONF>/ receives
-  <KERNCONF>.tar.xz        boot/kernel (kernel and modules) and METALOG
+  <KERNCONF>.tar.xz        boot/kernel (kernel and modules), boot/dtb and
+                           a METALOG of those
   <KERNCONF>-debug.tar.xz  usr/lib/debug/boot/kernel (separate debug files)
+                           and a METALOG of those
   BUILD                    source commit/tree, configuration, host tools
   SHA256SUMS               of the two archives and of boot/kernel/kernel
 """
@@ -193,6 +195,11 @@ def main():
     print(f"==> {commit} (tree {tree}) in {src}", flush=True)
     print("==> kernel-toolchain", flush=True)
     make("kernel-toolchain")
+    # vers.c is regenerated only when the kernel relinks; drop it so every
+    # kernel's version string names the commit it was built from.
+    for conf in kernconfs:
+        kobj = obj / str(src).lstrip("/") / "riscv.riscv64" / "sys" / conf
+        (kobj / "vers.c").unlink(missing_ok=True)
     print(f"==> buildkernel {' '.join(kernconfs)}", flush=True)
     make(f"KERNCONF={' '.join(kernconfs)}", "buildkernel")
 
@@ -212,10 +219,18 @@ def main():
         kernel = stage / "boot" / "kernel" / "kernel"
         if not kernel.is_file() or not (stage / "METALOG").is_file():
             sys.exit(f"k1-kernels: {conf}: no kernel or METALOG in {stage}")
-        tar(stage, dest / f"{conf}.tar.xz", ["METALOG", "boot"], epoch)
-        debug = [] if not (stage / "usr").exists() else ["usr"]
-        if debug:
-            tar(stage, dest / f"{conf}-debug.tar.xz", debug, epoch)
+        # Each archive carries the METALOG entries of its own files.
+        metalog = (stage / "METALOG").read_text().splitlines(keepends=True)
+        for name, top in ((f"{conf}.tar.xz", "boot"), (f"{conf}-debug.tar.xz", "usr")):
+            if not (stage / top).exists():
+                continue
+            entries = [
+                line
+                for line in metalog
+                if line.startswith(("./ ", f"./{top} ", f"./{top}/"))
+            ]
+            (stage / "METALOG").write_text("".join(entries))
+            tar(stage, dest / name, ["METALOG", top], epoch)
         (dest / "BUILD").write_text(
             f"kernconf={conf}\n"
             f"freebsd_commit={commit}\n"
