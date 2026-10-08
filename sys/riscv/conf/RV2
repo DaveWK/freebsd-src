@@ -20,6 +20,7 @@ device		dwc3
 device		spacemit_usb2phy
 device		spacemit_combphy
 device		spacemit_tsensor
+device		spacemit_cpufreq
 device		spacemit_rtc
 device		spacemit_crng
 device		iicbus

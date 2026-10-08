@@ -18,6 +18,7 @@ dev/random/spacemit_crng.c	optional spacemit_crng fdt
 dev/smte/if_smte.c		optional smte fdt
 dev/spacemit/spacemit_reset.c	optional spacemit_reset
 dev/spacemit/spacemit_rtc.c	optional spacemit_rtc fdt
+dev/spacemit/spacemit_cpufreq.c	optional spacemit_cpufreq cpufreq fdt
 dev/spacemit/spacemit_tsensor.c	optional spacemit_tsensor fdt
 dev/spibus/controller/spacemit/spacemit_spi.c optional spacemit_spi fdt
 dev/usb/controller/dwc3/dwc3.c optional xhci fdt dwc3
