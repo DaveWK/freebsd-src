@@ -1,13 +1,16 @@
 ---
 # Cross-build the SpacemiT K1 kernels R2SPROD and RV2PROD on the Fedora 44
-# Forgejo runner (label fedora44) for pull requests, and keep each one's
-# installkernel -DNO_ROOT tree (kernel, modules, METALOG) as a run artifact.
+# Forgejo runner (label fedora44) for pull requests and for every push
+# (merge) to staging, and keep each one's installkernel -DNO_ROOT tree
+# (kernel, modules, METALOG) as a run artifact.
 # The source and object trees persist in the runner's ~/.cache, so later runs
 # are incremental. BUILD-ONLY: nothing here touches a board.
 name: k1-kernels
 
 on:
   pull_request:
+  push:
+    branches: [staging]
   workflow_dispatch:
 
 jobs:
