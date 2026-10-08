@@ -20,7 +20,7 @@ jobs:
       - name: Build R2SPROD and RV2PROD
         run: python3 .forgejo/k1-kernels.py --out k1-kernels
       - name: Upload R2SPROD
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: R2SPROD
           path: |
@@ -28,7 +28,7 @@ jobs:
             k1-kernels/R2SPROD/BUILD
             k1-kernels/R2SPROD/SHA256SUMS
       - name: Upload RV2PROD
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: RV2PROD
           path: |
@@ -36,7 +36,7 @@ jobs:
             k1-kernels/RV2PROD/BUILD
             k1-kernels/RV2PROD/SHA256SUMS
       - name: Upload the debug files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: kernel-debug
           path: k1-kernels/*/*-debug.tar.xz
