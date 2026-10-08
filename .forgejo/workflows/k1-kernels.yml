@@ -1,0 +1,43 @@
+---
+# Cross-build the SpacemiT K1 kernels R2SPROD and RV2PROD on the Fedora 44
+# Forgejo runner (label fedora44) for pull requests, and keep each one's
+# installkernel -DNO_ROOT tree (kernel, modules, METALOG) as a run artifact.
+# The source and object trees persist in the runner's ~/.cache, so later runs
+# are incremental. BUILD-ONLY: nothing here touches a board.
+name: k1-kernels
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  kernels:
+    runs-on: fedora44
+    timeout-minutes: 240
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Build R2SPROD and RV2PROD
+        run: python3 .forgejo/k1-kernels.py --out k1-kernels
+      - name: Upload R2SPROD
+        uses: actions/upload-artifact@v4
+        with:
+          name: R2SPROD
+          path: |
+            k1-kernels/R2SPROD/R2SPROD.tar.xz
+            k1-kernels/R2SPROD/BUILD
+            k1-kernels/R2SPROD/SHA256SUMS
+      - name: Upload RV2PROD
+        uses: actions/upload-artifact@v4
+        with:
+          name: RV2PROD
+          path: |
+            k1-kernels/RV2PROD/RV2PROD.tar.xz
+            k1-kernels/RV2PROD/BUILD
+            k1-kernels/RV2PROD/SHA256SUMS
+      - name: Upload the debug files
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-debug
+          path: k1-kernels/*/*-debug.tar.xz
+          if-no-files-found: ignore
