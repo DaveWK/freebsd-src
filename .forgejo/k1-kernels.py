@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--kernconf", action="append", choices=KERNCONFS)
     args = ap.parse_args()
     kernconfs = args.kernconf or list(KERNCONFS)
+    # make runs in the source tree: DESTDIR must be absolute.
+    args.out = args.out.resolve()
     checkout = Path.cwd()
 
     for tool in ("clang", "ld.lld", "llvm-ar", "llvm-nm", "llvm-objcopy", "git"):
