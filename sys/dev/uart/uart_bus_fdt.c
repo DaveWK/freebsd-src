@@ -39,6 +39,9 @@
 
 #include <machine/bus.h>
 
+#if defined(__arm__) || defined(__aarch64__) || defined(__riscv)
+#include <dev/clk/clk.h>
+#endif
 #include <dev/fdt/fdt_common.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -169,6 +172,34 @@ uart_fdt_find_by_node(phandle_t node, int class_list)
 	return (0);
 }
 
+#if defined(__arm__) || defined(__aarch64__) || defined(__riscv)
+/*
+ * Without a clock-frequency property, take the rate of the UART's functional
+ * clock: the one named "core" or "baudclk", or else the first clock.  Enable
+ * it, and a "bus" clock if there is one.  Return 0 if no rate is known.
+ */
+static u_int
+uart_fdt_clocks_rate(device_t dev)
+{
+	clk_t clk, bus;
+	uint64_t freq;
+
+	if (clk_get_by_ofw_name(dev, 0, "core", &clk) != 0 &&
+	    clk_get_by_ofw_name(dev, 0, "baudclk", &clk) != 0 &&
+	    clk_get_by_ofw_index(dev, 0, 0, &clk) != 0)
+		return (0);
+	if (clk_enable(clk) != 0 || clk_get_freq(clk, &freq) != 0 ||
+	    freq == 0 || freq > UINT_MAX) {
+		clk_release(clk);
+		return (0);
+	}
+	if (clk_get_by_ofw_name(dev, 0, "bus", &bus) == 0 &&
+	    clk_enable(bus) != 0)
+		clk_release(bus);
+	return ((u_int)freq);
+}
+#endif
+
 int
 uart_cpu_fdt_probe(struct uart_class **classp, bus_space_tag_t *bst,
     bus_space_handle_t *bsh, int *baud, u_int *rclk, u_int *shiftp,
@@ -275,6 +306,7 @@ uart_fdt_probe(device_t dev)
 	struct uart_softc *sc;
 	phandle_t node;
 	pcell_t clock, shift, iowidth;
+	bool from_clocks;
 	int err;
 
 	sc = device_get_softc(dev);
@@ -290,12 +322,27 @@ uart_fdt_probe(device_t dev)
 
 	if ((err = uart_fdt_get_clock(node, &clock)) != 0)
 		return (err);
+	from_clocks = false;
+#if defined(__arm__) || defined(__aarch64__) || defined(__riscv)
+	if (clock == 0 && (clock = uart_fdt_clocks_rate(dev)) != 0)
+		from_clocks = true;
+#endif
 	if (uart_fdt_get_shift(node, &shift) != 0)
 		shift = uart_getregshift(sc->sc_class);
 	if (uart_fdt_get_io_width(node, &iowidth) != 0)
 		iowidth = uart_getregiowidth(sc->sc_class);
 
-	return (uart_bus_probe(dev, (int)shift, (int)iowidth, (int)clock, 0, 0, 0));
+	err = uart_bus_probe(dev, (int)shift, (int)iowidth, (int)clock, 0, 0, 0);
+	/*
+	 * The console was set up from this node before the clock framework
+	 * was available, so its rclk is the class default rather than the
+	 * real rate.  Use the clock's rate from now on.
+	 */
+	if (err == 0 && from_clocks && sc->sc_sysdev != NULL) {
+		sc->sc_sysdev->bas.rclk = clock;
+		sc->sc_bas.rclk = clock;
+	}
+	return (err);
 }
 
 DRIVER_MODULE(uart, simplebus, uart_fdt_driver, 0, 0);
