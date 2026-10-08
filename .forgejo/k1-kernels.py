@@ -28,6 +28,32 @@ import sys
 from pathlib import Path
 
 KERNCONFS = ("R2SPROD", "RV2PROD")
+# Host commands the build needs, with the Fedora package that provides each:
+# the cross toolchain, and the tools tools/build/Makefile links into the
+# bootstrap tree (_host_tools_to_symlink, /bin/bash).
+HOST_TOOLS = {
+    "clang": "clang",
+    "ld.lld": "lld",
+    "llvm-ar": "llvm",
+    "llvm-nm": "llvm",
+    "llvm-objcopy": "llvm",
+    "cc": "gcc",
+    "git": "git",
+    "tar": "tar",
+    "/bin/bash": "bash",
+    "bzip2": "bzip2",
+    "bunzip2": "bzip2",
+    "cmp": "diffutils",
+    "find": "findutils",
+    "gzip": "gzip",
+    "gunzip": "gzip",
+    "hostname": "hostname",
+    "patch": "patch",
+    "time": "time",
+    "which": "which",
+    "xz": "xz",
+    "unxz": "xz",
+}
 DATE_SHIM = """#!/bin/sh
 # The bootstrap uses BSD date -ur EPOCH; translate it for GNU date.
 if [ "$1" = "-ur" ]; then
@@ -111,9 +137,18 @@ def main():
     args.out = args.out.resolve()
     checkout = Path.cwd()
 
-    for tool in ("clang", "ld.lld", "llvm-ar", "llvm-nm", "llvm-objcopy", "git"):
-        if shutil.which(tool) is None:
-            sys.exit(f"k1-kernels: missing {tool}")
+    missing = {
+        tool: pkg
+        for tool, pkg in HOST_TOOLS.items()
+        if shutil.which(tool, path="/usr/bin:/bin") is None
+    }
+    if missing:
+        sys.exit(
+            "k1-kernels: missing host tools: "
+            + " ".join(missing)
+            + "; Fedora packages: "
+            + " ".join(sorted(set(missing.values())))
+        )
 
     args.cache.mkdir(parents=True, exist_ok=True)
     lock = open(args.cache / "lock", "w")
