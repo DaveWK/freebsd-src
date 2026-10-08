@@ -1,0 +1,42 @@
+---
+# style(9) check of a pull request's commits with tools/build/checkstyle9.pl,
+# as upstream's .github/workflows/style.yml does on GitHub. Forgejo reads only
+# .forgejo/workflows once it exists, so this replaces that job here, on the
+# Fedora 44 runner. Forgejo's pull_request payload has no commit count, so the
+# PR's commits are fetched with --shallow-exclude of the base branch, plus one
+# more level for the base commit. Read-only: no secrets.
+name: Style Checker
+
+on:
+  pull_request:
+    branches: [OpiK1, staging]
+    types: [opened, reopened, edited, synchronize]
+    paths: ['**.S', '**.c', '**.cc', '**.cpp', '**.h', '**.hh', '**.hpp']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Style Checker
+    runs-on: fedora44
+    timeout-minutes: 30
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Fetch the pull request's commits
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          git fetch --no-tags --shallow-exclude="$BASE_REF" origin "$HEAD_SHA"
+          echo "COMMITS=$(git rev-list --count "$HEAD_SHA")" >>"$GITHUB_ENV"
+          git fetch --no-tags --deepen=1 origin "$HEAD_SHA"
+      - name: Run checker
+        run: |
+          sha=$(git rev-parse HEAD~${{ env.COMMITS }})
+          tools/build/checkstyle9.pl --github ${sha}..${{ github.event.pull_request.head.sha }}
