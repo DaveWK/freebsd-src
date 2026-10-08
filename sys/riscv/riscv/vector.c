@@ -197,6 +197,10 @@ vector_state_init(struct thread *td)
 	len = vector_get_size();
 
 	p->pcb_vsaved = malloc(len, M_RVV_CTX, M_WAITOK | M_ZERO);
+	p->pcb_vstart = 0;
+	p->pcb_vtype = 0;
+	p->pcb_vl = 0;
+	p->pcb_vcsr = 0;
 }
 
 void
@@ -217,16 +221,55 @@ vector_copy_thread(struct thread *td1, struct thread *td2)
 	len = vector_get_size();
 
 	memcpy(p2->pcb_vsaved, p1->pcb_vsaved, len);
+	p2->pcb_vstart = p1->pcb_vstart;
+	p2->pcb_vtype = p1->pcb_vtype;
+	p2->pcb_vl = p1->pcb_vl;
+	p2->pcb_vcsr = p1->pcb_vcsr;
+}
+
+/*
+ * Drop a thread's vector save area together with PCB_VS_STARTED.  The flag
+ * and the buffer are one invariant: cpu_fork() tests only the flag before
+ * calling vector_state_store(), which asserts the buffer is non-NULL, and
+ * trap.c re-runs vector_state_init(), which asserts pcb_vsaved == NULL, on
+ * the next vector instruction of a thread whose flag is clear.
+ */
+void
+vector_state_free(struct thread *td)
+{
+	struct pcb *pcb;
+
+	pcb = td->td_pcb;
+	free(pcb->pcb_vsaved, M_RVV_CTX);
+	pcb->pcb_vsaved = NULL;
+	pcb->pcb_vsflags &= ~PCB_VS_STARTED;
 }
 
 static void
 vector_thread_dtor(void *arg __unused, struct thread *td)
 {
-	void *datap;
 
-	datap = td->td_pcb->pcb_vsaved;
-
-	free(datap, M_RVV_CTX);
+	/*
+	 * Thread structures are recycled through UMA, and nothing clears
+	 * pcb_vsaved on reuse.  Freeing it without clearing it here lets a
+	 * recycled thread that never allocated a vector context free the
+	 * previous owner's buffer a second time:
+	 *
+	 *   panic: Duplicate free of 0x... from zone ...(malloc-1024)
+	 *       vector_thread_dtor() thread_reap_domain() thread_wait()
+	 *
+	 * malloc-1024 is the save area itself: VLEN=256 * 32 registers.
+	 * Observed on a SpacemiT K1 running userland built with RVV enabled.
+	 * Leaving the flag set while clearing the pointer hands a recycled
+	 * thread a context it no longer owns:
+	 *
+	 *   panic: VS area is NULL
+	 *
+	 * Observed on a SpacemiT K1 building packages, in a fork off a
+	 * recycled thread.  free(NULL) is a no-op, so the NULL case needs no
+	 * test.
+	 */
+	vector_state_free(td);
 }
 
 static void

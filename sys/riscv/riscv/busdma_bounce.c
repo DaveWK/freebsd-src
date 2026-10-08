@@ -54,6 +54,7 @@
 #include <machine/atomic.h>
 #include <machine/bus.h>
 #include <machine/md_var.h>
+#include <machine/thead.h>
 #include <machine/bus_dma_impl.h>
 
 #define MAX_BPAGES 4096
@@ -68,16 +69,37 @@ enum {
 struct bounce_page;
 struct bounce_zone;
 
+/*
+ * A translation window: CPU physical [cpu_start, cpu_end] appears to the
+ * devices under a tag at bus_start.  Addresses inside a window need no
+ * bounce even when lowaddr excludes them; segments carry the bus address.
+ */
+#define	BUS_DMA_MAX_WINDOWS	4
+
+struct bus_dma_window {
+	bus_addr_t		cpu_start;
+	bus_addr_t		cpu_end;
+	bus_addr_t		bus_start;
+};
+
 struct bus_dma_tag {
 	struct bus_dma_tag_common common;
 	int			map_count;
 	int			bounce_flags;
 	bus_dma_segment_t	*segments;
 	struct bounce_zone	*bounce_zone;
+	u_int			nwindows;
+	struct bus_dma_window	windows[BUS_DMA_MAX_WINDOWS];
 };
 
 static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Busdma parameters");
+
+/* Experimental RV2 ordering comparison; not an accepted platform quirk. */
+static int nvme_postread_fence = 1;
+SYSCTL_INT(_hw_busdma, OID_AUTO, nvme_postread_fence, CTLFLAG_RWTUN,
+    &nvme_postread_fence, 0,
+    "Fence noncoherent offset-preserving bounce reads before copying");
 
 struct sync_list {
 	char		*vaddr;		/* kva of client data */
@@ -99,6 +121,8 @@ struct bus_dmamap {
 	u_int			flags;
 #define	DMAMAP_COULD_BOUNCE	(1 << 0)
 #define	DMAMAP_FROM_DMAMEM	(1 << 1)
+#define	DMAMAP_MBUF		(1 << 2)
+#define	DMAMAP_COHERENT		(1 << 3)
 	int			sync_count;
 	struct sync_list	slist[];
 };
@@ -156,7 +180,20 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 
 		/* Copy some flags from the parent */
 		newtag->bounce_flags |= parent->bounce_flags & BF_COHERENT;
+
+		/* Children see memory through the same windows. */
+		newtag->nwindows = parent->nwindows;
+		memcpy(newtag->windows, parent->windows,
+		    sizeof(newtag->windows));
 	}
+
+	/*
+	 * Non-coherent RISC-V DMA (e.g. SpacemiT K1): unaligned streaming
+	 * buffers must be bounced (cacheline_bounce()); enable bouncing on
+	 * every non-coherent tag so bounce pages are available for them.
+	 */
+	if ((newtag->bounce_flags & BF_COHERENT) == 0)
+		newtag->bounce_flags |= BF_COULD_BOUNCE;
 
 	if (newtag->common.lowaddr < ptoa((vm_paddr_t)Maxmem) ||
 	    newtag->common.alignment > 1)
@@ -403,6 +440,13 @@ bounce_bus_dmamem_alloc(bus_dma_tag_t dmat, void** vaddr, int flags,
 		return (ENOMEM);
 	}
 	(*mapp)->flags = DMAMAP_FROM_DMAMEM;
+	/*
+	 * Only skip cache maintenance when pmap can encode uncacheable
+	 * memory. Without PBMT support, the requested attribute is ignored.
+	 */
+	if (attr == VM_MEMATTR_UNCACHEABLE &&
+	    (has_svpbmt || has_errata_thead_pbmt))
+		(*mapp)->flags |= DMAMAP_COHERENT;
 
 	/*
 	 * Allocate the buffer from the malloc(9) allocator if...
@@ -483,6 +527,100 @@ bounce_bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
 	    dmat->bounce_flags);
 }
 
+/*
+ * Return true if a non-coherent streaming buffer is not aligned to a cache
+ * line on both ends and therefore must be bounced.  dma_dcache_sync()'s
+ * POSTREAD path invalidates at cache-line granularity; a partial edge line
+ * shared with a neighbouring allocation would have that allocation's dirty
+ * data discarded -> heap corruption.  Ported from the arm64 bus_dma code
+ * that the RISC-V implementation was derived from but which omitted it.
+ * bus_dmamem_alloc'd, coherent and mbuf buffers are exempt.
+ */
+static bool
+cacheline_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
+    bus_size_t size)
+{
+	if ((dmat->bounce_flags & BF_COHERENT) != 0)
+		return (false);
+	if (map != NULL && (map->flags &
+	    (DMAMAP_FROM_DMAMEM | DMAMAP_COHERENT | DMAMAP_MBUF)) != 0)
+		return (false);
+	return (((paddr | size) & (dcache_line_size - 1)) != 0);
+}
+
+/*
+ * Return the translation window holding all of [paddr, paddr + size), if any.
+ */
+static const struct bus_dma_window *
+dma_window(bus_dma_tag_t dmat, bus_addr_t paddr, bus_size_t size)
+{
+	const struct bus_dma_window *w;
+	u_int i;
+
+	for (i = 0; i < dmat->nwindows; i++) {
+		w = &dmat->windows[i];
+		if (paddr >= w->cpu_start && paddr <= w->cpu_end &&
+		    size - 1 <= w->cpu_end - paddr)
+			return (w);
+	}
+	return (NULL);
+}
+
+/*
+ * The address a device uses for CPU physical address paddr.
+ */
+static bus_addr_t
+dma_bus_addr(bus_dma_tag_t dmat, bus_addr_t paddr)
+{
+	const struct bus_dma_window *w;
+
+	w = dma_window(dmat, paddr, 1);
+	if (w == NULL)
+		return (paddr);
+	return (paddr - w->cpu_start + w->bus_start);
+}
+
+static bool
+must_bounce(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t paddr,
+    bus_size_t size)
+{
+	if (cacheline_bounce(dmat, map, paddr, size))
+		return (true);
+	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0 &&
+	    addr_needs_bounce(dmat, paddr)) {
+		/* A translation window makes an excluded range reachable. */
+		if (vm_addr_align_ok(paddr, dmat_alignment(dmat)) &&
+		    dma_window(dmat, paddr, size) != NULL)
+			return (false);
+		return (true);
+	}
+	return (false);
+}
+
+/*
+ * Let the devices under dmat, and tags created from it afterwards, reach CPU
+ * physical [cpu_start, cpu_start + size) at bus address bus_start, as a
+ * parent bus's dma-ranges describes.
+ */
+int
+bus_dma_tag_add_window(bus_dma_tag_t dmat, bus_addr_t cpu_start,
+    bus_size_t size, bus_addr_t bus_start)
+{
+	struct bus_dma_window *w;
+
+	if (dmat->common.impl != &bus_dma_bounce_impl || size == 0 ||
+	    cpu_start + (size - 1) < cpu_start ||
+	    bus_start + (size - 1) < bus_start)
+		return (EINVAL);
+	if (dmat->nwindows == BUS_DMA_MAX_WINDOWS)
+		return (ENOSPC);
+	w = &dmat->windows[dmat->nwindows++];
+	w->cpu_start = cpu_start;
+	w->cpu_end = cpu_start + (size - 1);
+	w->bus_start = bus_start;
+	return (0);
+}
+
 static void
 _bus_dmamap_count_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
     bus_size_t buflen, int flags)
@@ -498,7 +636,7 @@ _bus_dmamap_count_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
 		curaddr = buf;
 		while (buflen != 0) {
 			sgsize = buflen;
-			if (addr_needs_bounce(dmat, curaddr)) {
+			if (must_bounce(dmat, map, curaddr, sgsize)) {
 				sgsize = MIN(sgsize,
 				    PAGE_SIZE - (curaddr & PAGE_MASK));
 				map->pagesneeded++;
@@ -540,15 +678,32 @@ _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
 				paddr = pmap_kextract(vaddr);
 			else
 				paddr = pmap_extract(pmap, vaddr);
-			if (addr_needs_bounce(dmat, paddr)) {
-				sg_len = roundup2(sg_len,
-				    dmat->common.alignment);
+			if (must_bounce(dmat, map, paddr, sg_len)) {
+				/* A retained offset leaves only the page remainder. */
+				if ((dmat->common.flags & BUS_DMA_KEEP_PG_OFFSET)
+				    == 0)
+					sg_len = roundup2(sg_len,
+					    dmat->common.alignment);
 				map->pagesneeded++;
 			}
 			vaddr += sg_len;
 		}
 		CTR1(KTR_BUSDMA, "pagesneeded= %d\n", map->pagesneeded);
 	}
+}
+
+/*
+ * A deferred load (EINPROGRESS) is restarted from the beginning once bounce
+ * pages are free, so it may only wait before it has built any segment, sync
+ * entry or bounce page.  Once a multi-call load (page or vector lists, uio)
+ * has added a segment (*segp >= 0), a reservation that cannot be met fails
+ * with ENOMEM instead of leaving partial state for the restart to append to.
+ */
+static int
+reserve_flags(int *segp, int flags)
+{
+
+	return (*segp >= 0 ? flags | BUS_DMA_NOWAIT : flags);
 }
 
 /*
@@ -571,7 +726,8 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) {
 		_bus_dmamap_count_phys(dmat, map, buf, buflen, flags);
 		if (map->pagesneeded != 0) {
-			error = _bus_dmamap_reserve_pages(dmat, map, flags);
+			error = _bus_dmamap_reserve_pages(dmat, map,
+			    reserve_flags(segp, flags));
 			if (error)
 				return (error);
 		}
@@ -583,13 +739,13 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	while (buflen > 0) {
 		curaddr = buf;
 		sgsize = buflen;
-		if (((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) &&
-		    map->pagesneeded != 0 &&
-		    addr_needs_bounce(dmat, curaddr)) {
+		if (map->pagesneeded != 0 &&
+		    must_bounce(dmat, map, curaddr, sgsize)) {
 			sgsize = MIN(sgsize, PAGE_SIZE - (curaddr & PAGE_MASK));
 			curaddr = add_bounce_page(dmat, map, 0, curaddr,
 			    sgsize);
-		} else if ((dmat->bounce_flags & BF_COHERENT) == 0) {
+		} else if ((dmat->bounce_flags & BF_COHERENT) == 0 &&
+		    (map->flags & DMAMAP_COHERENT) == 0) {
 			if (map->sync_count > 0)
 				sl_end = sl->paddr + sl->datacount;
 
@@ -607,8 +763,8 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 			} else
 				sl->datacount += sgsize;
 		}
-		if (!_bus_dmamap_addsegs(dmat, map, curaddr, sgsize, segs,
-		    segp))
+		if (!_bus_dmamap_addsegs(dmat, map, dma_bus_addr(dmat, curaddr),
+		    sgsize, segs, segp))
 			break;
 		buf += sgsize;
 		buflen -= sgsize;
@@ -617,7 +773,11 @@ bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
 	/*
 	 * Did we fit?
 	 */
-	return (buflen != 0 ? EFBIG : 0); /* XXX better return value here? */
+	if (buflen != 0) {
+		bus_dmamap_unload(dmat, map);
+		return (EFBIG);
+	}
+	return (0);
 }
 
 /*
@@ -635,13 +795,17 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 	char *kvaddr, *vaddr, *sl_vend;
 	int error;
 
+	if ((flags & BUS_DMA_LOAD_MBUF) != 0)
+		map->flags |= DMAMAP_MBUF;
+
 	if (segs == NULL)
 		segs = dmat->segments;
 
 	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) {
 		_bus_dmamap_count_pages(dmat, map, pmap, buf, buflen, flags);
 		if (map->pagesneeded != 0) {
-			error = _bus_dmamap_reserve_pages(dmat, map, flags);
+			error = _bus_dmamap_reserve_pages(dmat, map,
+			    reserve_flags(segp, flags));
 			if (error)
 				return (error);
 		}
@@ -668,14 +832,16 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 		 * Compute the segment size, and adjust counts.
 		 */
 		sgsize = MIN(buflen, PAGE_SIZE - (curaddr & PAGE_MASK));
-		if (((dmat->bounce_flags & BF_COULD_BOUNCE) != 0) &&
-		    map->pagesneeded != 0 &&
-		    addr_needs_bounce(dmat, curaddr)) {
-			sgsize = roundup2(sgsize, dmat->common.alignment);
+		if (map->pagesneeded != 0 &&
+		    must_bounce(dmat, map, curaddr, sgsize)) {
+			/* Match the page-bounded count when retaining offsets. */
+			if ((dmat->common.flags & BUS_DMA_KEEP_PG_OFFSET) == 0)
+				sgsize = roundup2(sgsize, dmat->common.alignment);
 			sgsize = MIN(sgsize, buflen);
 			curaddr = add_bounce_page(dmat, map, kvaddr, curaddr,
 			    sgsize);
-		} else if ((dmat->bounce_flags & BF_COHERENT) == 0) {
+		} else if ((dmat->bounce_flags & BF_COHERENT) == 0 &&
+		    (map->flags & DMAMAP_COHERENT) == 0) {
 			if (map->sync_count > 0) {
 				sl_pend = sl->paddr + sl->datacount;
 				sl_vend = sl->vaddr + sl->datacount;
@@ -702,8 +868,8 @@ bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 			} else
 				sl->datacount += sgsize;
 		}
-		if (!_bus_dmamap_addsegs(dmat, map, curaddr, sgsize, segs,
-		    segp))
+		if (!_bus_dmamap_addsegs(dmat, map, dma_bus_addr(dmat, curaddr),
+		    sgsize, segs, segp))
 			break;
 		vaddr += sgsize;
 		buflen -= MIN(sgsize, buflen); /* avoid underflow */
@@ -713,7 +879,49 @@ cleanup:
 	/*
 	 * Did we fit?
 	 */
-	return (buflen != 0 ? EFBIG : 0); /* XXX better return value here? */
+	if (buflen != 0) {
+		bus_dmamap_unload(dmat, map);
+		return (EFBIG);
+	}
+	return (0);
+}
+
+/*
+ * Load a list of pages.  bus_dmamap_load_ma_triv() loads them one at a time,
+ * which would count and reserve bounce pages one page at a time and so could
+ * need to wait partway through.  Count and reserve for the whole list first,
+ * so that a load that must wait does so before it builds anything; the
+ * per-page loads then find their pages already reserved.
+ */
+static int
+bounce_bus_dmamap_load_ma(bus_dma_tag_t dmat, bus_dmamap_t map,
+    struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
+    bus_dma_segment_t *segs, int *segp)
+{
+	vm_paddr_t paddr;
+	bus_size_t len, left;
+	int error, i, offs;
+
+	if ((dmat->bounce_flags & BF_COULD_BOUNCE) != 0 &&
+	    (map->flags & DMAMAP_COULD_BOUNCE) != 0 && map->pagesneeded == 0) {
+		offs = ma_offs;
+		for (i = 0, left = tlen; left > 0; i++, left -= len) {
+			len = MIN(PAGE_SIZE - offs, left);
+			paddr = VM_PAGE_TO_PHYS(ma[i]) + offs;
+			/* load_phys bounces each page-bounded chunk in one page. */
+			if (must_bounce(dmat, map, paddr, len))
+				map->pagesneeded++;
+			offs = 0;
+		}
+		if (map->pagesneeded != 0) {
+			error = _bus_dmamap_reserve_pages(dmat, map,
+			    reserve_flags(segp, flags));
+			if (error != 0)
+				return (error);
+		}
+	}
+	return (bus_dmamap_load_ma_triv(dmat, map, ma, tlen, ma_offs, flags,
+	    segs, segp));
 }
 
 static void
@@ -747,6 +955,7 @@ bounce_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 {
 	free_bounce_pages(dmat, map);
 	map->sync_count = 0;
+	map->flags &= ~DMAMAP_MBUF;
 }
 
 static void
@@ -867,9 +1076,15 @@ bounce_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
 			}
 			dmat->bounce_zone->total_bounced++;
 		} else if ((op & BUS_DMASYNC_PREREAD) != 0) {
+			/*
+			 * Clean dirty data before giving the device ownership.
+			 * The private bounce pages are not accessed by the CPU
+			 * until POSTREAD invalidates them after DMA completion,
+			 * so invalidating them here as well is unnecessary.
+			 */
 			while (bpage != NULL) {
 				if ((dmat->bounce_flags & BF_COHERENT) == 0)
-					cpu_dcache_wbinv_range(bpage->vaddr,
+					cpu_dcache_wb_range(bpage->vaddr,
 					    bpage->datacount);
 				bpage = STAILQ_NEXT(bpage, links);
 			}
@@ -877,9 +1092,20 @@ bounce_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
 
 		if ((op & BUS_DMASYNC_POSTREAD) != 0) {
 			while (bpage != NULL) {
-				if ((dmat->bounce_flags & BF_COHERENT) == 0)
+				if ((dmat->bounce_flags & BF_COHERENT) == 0) {
 					cpu_dcache_inv_range(bpage->vaddr,
 					    bpage->datacount);
+					/*
+					 * RV2 tracing found stale initial loads in a
+					 * backwards page copy after invalidation.
+					 * Compare an explicit barrier with the ISA's
+					 * normal overlapping-address CBO ordering.
+					 */
+					if (nvme_postread_fence != 0 &&
+					    (dmat->common.flags &
+					    BUS_DMA_KEEP_PG_OFFSET) != 0)
+						fence();
+				}
 				tempvaddr = NULL;
 				datavaddr = bpage->datavaddr;
 				if (datavaddr == NULL) {
@@ -928,7 +1154,7 @@ struct bus_dma_impl bus_dma_bounce_impl = {
 	.mem_free = bounce_bus_dmamem_free,
 	.load_phys = bounce_bus_dmamap_load_phys,
 	.load_buffer = bounce_bus_dmamap_load_buffer,
-	.load_ma = bus_dmamap_load_ma_triv,
+	.load_ma = bounce_bus_dmamap_load_ma,
 	.map_waitok = bounce_bus_dmamap_waitok,
 	.map_complete = bounce_bus_dmamap_complete,
 	.map_unload = bounce_bus_dmamap_unload,

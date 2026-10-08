@@ -155,7 +155,7 @@ nvme_ctrlr_construct_io_qpairs(struct nvme_controller *ctrlr)
 	uint32_t		cap_lo;
 	uint16_t		mqes;
 	int			c, error, i, n;
-	int			num_entries, num_trackers, max_entries;
+	int			num_entries, num_trackers, max_entries, honor_maxcmd;
 
 	/*
 	 * NVMe spec sets a hard limit of 64K max entries, but devices may
@@ -191,7 +191,15 @@ nvme_ctrlr_construct_io_qpairs(struct nvme_controller *ctrlr)
 	 */
 	num_trackers = min(num_trackers, (num_entries-1));
 
-	if (ctrlr->cdata.maxcmd != 0 && num_trackers > ctrlr->cdata.maxcmd) {
+	/*
+	 * The host may use MAXCMD to size its queues but is not required to,
+	 * and some controllers report a value well below the depth they
+	 * sustain, so allow ignoring it.
+	 */
+	honor_maxcmd = 1;
+	TUNABLE_INT_FETCH("hw.nvme.honor_maxcmd", &honor_maxcmd);
+	if (honor_maxcmd != 0 && ctrlr->cdata.maxcmd != 0 &&
+	    num_trackers > ctrlr->cdata.maxcmd) {
 		nvme_printf(ctrlr,
 		    "limiting trackers per I/O queue to MAXCMD (%u -> %u)\n",
 		    num_trackers, ctrlr->cdata.maxcmd);

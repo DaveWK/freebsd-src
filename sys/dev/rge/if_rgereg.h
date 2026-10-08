@@ -28,6 +28,33 @@
 /* For now, a single MSI message, no multi-RX/TX ring support */
 #define	RGE_MSI_MESSAGES	1
 
+/*
+ * RTL8125B+ "v2" interrupt space, used with MSI-X: bit n of the 32-bit
+ * ISR/IMR pair is delivered on MSI-X vector n.  Receive queue q completes
+ * on vector q, the transmit queue on 16 and link change on 21, so the
+ * device wants 22 vectors even when few queues are used (Realtek r8125).
+ */
+#define RGE_MSIX_MESSAGES	22
+#define RGE_MAX_RX_QUEUES	8	/* 8125B hardware limit (r8125 HwSuppNumRxQueues) */
+#define RGE_MAX_TX_QUEUES	2	/* 8125B hardware limit (r8125 CFG_METHOD_5) */
+#define RGE_V2_VEC_TX		16	/* TX queue 0 completion (ISR bit 16) */
+#define RGE_V2_VEC_TX_Q1	18	/* TX queue 1 completion (ISR bit 18) */
+#define RGE_V2_VEC_LINK		21
+/* TX completion vector for queue q: q0 -> 16, q1 -> 18. */
+#define RGE_V2_VEC_TX_Q(q)	((q) == 0 ? RGE_V2_VEC_TX : RGE_V2_VEC_TX_Q1)
+#define RGE_IMR_V2_CLR		0x0d00
+#define RGE_ISR_V2		0x0d04
+#define RGE_IMR_V2_SET		0x0d0c
+#define RGE_ISR_V2_ROK(q)	(1U << (q))
+#define RGE_ISR_V2_TOK_Q0	0x00010000	/* ISR bit 16 */
+#define RGE_ISR_V2_TOK_Q1	0x00040000	/* ISR bit 18 */
+#define RGE_ISR_V2_TOK(q)	((q) == 0 ? RGE_ISR_V2_TOK_Q0 : RGE_ISR_V2_TOK_Q1)
+#define RGE_ISR_V2_LINKCHG	0x00200000
+#define RGE_INTMITI_V2_RX(q)	(0x0a00 + (q) * 8)	/* 8-bit timer per queue */
+#define RGE_INTMITI_V2_TX(q)	(0x0a02 + (q) * 8)
+#define RGE_RXDESC_ADDR_Q_LO(q)	(0x4000 + ((q) - 1) * 8)	/* queues >= 1 */
+#define RGE_RXDESC_ADDR_Q_HI(q)	(0x4004 + ((q) - 1) * 8)
+
 #define RGE_MAC0		0x0000
 #define RGE_MAC4		0x0004
 #define RGE_MAR0		0x0008
@@ -37,6 +64,9 @@
 #define	RGE_DTCCR_HI		0x0014
 #define RGE_TXDESC_ADDR_LO	0x0020
 #define RGE_TXDESC_ADDR_HI	0x0024
+/* TX queue 1 descriptor ring base (r8125 TNPDS_Q1_LOW_8125 + (q-1)*8). */
+#define RGE_TXDESC_ADDR_Q_LO(q)	(0x2100 + ((q) - 1) * 8)	/* queues >= 1 */
+#define RGE_TXDESC_ADDR_Q_HI(q)	(0x2104 + ((q) - 1) * 8)
 #define RGE_INT_CFG0		0x0034
 #define RGE_CMD			0x0037
 #define RGE_IMR			0x0038
@@ -81,7 +111,30 @@
 #define RGE_ADDR0		0x19e0
 #define RGE_ADDR1		0x19e4
 #define RGE_RSS_CTRL		0x4500
+#define RGE_RSS_KEY		0x4600	/* 40 bytes */
+#define RGE_RSS_INDIR_TBL	0x4700	/* 128 one-byte entries */
 #define RGE_RXQUEUE_CTRL	0x4800
+
+/* Flags for register RGE_RSS_CTRL (Realtek r8125 _rtl8125_set_rss_hash_opt) */
+#define RGE_RSS_CTRL_TCP_IPV4		0x00000001
+#define RGE_RSS_CTRL_IPV4		0x00000002
+#define RGE_RSS_CTRL_TCP_IPV6		0x00000004
+#define RGE_RSS_CTRL_IPV6		0x00000008
+#define RGE_RSS_CTRL_IPV6_EXT		0x00000010
+#define RGE_RSS_CTRL_TCP_IPV6_EXT	0x00000020
+#define RGE_RSS_CTRL_HASH_MASK_SHIFT	8	/* log2(indirection entries) */
+#define RGE_RSS_CTRL_UDP_IPV4		0x00000800
+#define RGE_RSS_CTRL_UDP_IPV6		0x00001000
+#define RGE_RSS_CTRL_UDP_IPV6_EXT	0x00002000
+#define RGE_RSS_CTRL_CPU_NUM_SHIFT	16	/* log2(rx queues) */
+#define RGE_RSS_INDIR_ENTRIES		128
+#define RGE_RSS_KEY_LEN			40
+
+/* RSS type in the v3 Rx descriptor hdr_info (RTL8125B) */
+#define RGE_RXHDR_RSS_UDP	0x0200
+#define RGE_RXHDR_RSS_IPV4	0x0400
+#define RGE_RXHDR_RSS_IPV6	0x1000
+#define RGE_RXHDR_RSS_TCP	0x2000
 #define RGE_EEE_TXIDLE_TIMER	0x6048
 
 /* Flags for register RGE_INT_CFG0 */
@@ -179,8 +232,9 @@
 #define RGE_EPHYAR_ADDR_MASK	0x0000007f
 #define RGE_EPHYAR_ADDR_SHIFT	16
 
-/* Flags for register RGE_TXSTART */
-#define RGE_TXSTART_START	0x0001
+/* Flags for register RGE_TXSTART (TPPOLL): one polling bit per TX queue. */
+#define RGE_TXSTART_START	0x0001		/* == RGE_TXSTART_Q(0) */
+#define RGE_TXSTART_Q(q)	(1U << (q))
 
 /* Flags for register RGE_MACOCP */
 #define RGE_MACOCP_DATA_MASK	0x0000ffff
@@ -232,12 +286,17 @@ struct rge_tx_desc {
 #define RGE_TDCMDSTS_COLL	0x000f0000
 #define RGE_TDCMDSTS_EXCESSCOLL	0x00100000
 #define RGE_TDCMDSTS_TXERR	0x00800000
+#define RGE_TDCMDSTS_GTTCPHO_SHIFT	18	/* TSO: TCP header offset */
+#define RGE_TDCMDSTS_GTTCPHO_MAX	0x7f
+#define RGE_TDCMDSTS_GTSENV4	0x04000000	/* TSO: giant send, IPv4 */
 #define RGE_TDCMDSTS_EOF	0x10000000
 #define RGE_TDCMDSTS_SOF	0x20000000
 #define RGE_TDCMDSTS_EOR	0x40000000
 #define RGE_TDCMDSTS_OWN	0x80000000
 
 #define RGE_TDEXTSTS_VTAG	0x00020000
+#define RGE_TDEXTSTS_MSS_SHIFT	18		/* TSO: MSS, 11 bits */
+#define RGE_TDEXTSTS_MSS_MAX	0x7ff
 #define RGE_TDEXTSTS_IPCSUM	0x20000000
 #define RGE_TDEXTSTS_TCPCSUM	0x40000000
 #define RGE_TDEXTSTS_UDPCSUM	0x80000000
@@ -382,6 +441,10 @@ struct rge_hw_mac_stats {
 #define RGE_TIMEOUT		100
 
 #define RGE_JUMBO_FRAMELEN	9216
+/* TSO: whole frame (if_hw_tsomax semantics); MSS field caps the usable MTU. */
+#define RGE_TSO_MAXSIZE		65535
+#define RGE_TSO_MAXSEGSIZE	4096
+#define RGE_TSO_MTU		(RGE_TDEXTSTS_MSS_MAX - ETHER_HDR_LEN - ETHER_CRC_LEN)
 #define RGE_JUMBO_MTU							\
 	(RGE_JUMBO_FRAMELEN - ETHER_HDR_LEN - ETHER_CRC_LEN - 		\
 	ETHER_VLAN_ENCAP_LEN)

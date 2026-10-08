@@ -100,9 +100,15 @@ cpu_fork(struct thread *td1, struct proc *p2, struct thread *td2, int flags)
 		critical_exit();
 	}
 
-	/* Ensure the Vector state is saved before copying the pcb. */
-	if ((td1->td_pcb->pcb_vsflags & PCB_VS_STARTED) != 0) {
+	/*
+	 * Ensure the Vector state is saved before copying the pcb.  Only a
+	 * dirty status means the live registers are newer than the save
+	 * area; off with a save area is a thread back from sigreturn whose
+	 * registers are in the area and not yet reloaded (see trap.c).
+	 */
+	if ((td1->td_frame->tf_sstatus & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY) {
 		MPASS(td1 == curthread);
+		MPASS((td1->td_pcb->pcb_vsflags & PCB_VS_STARTED) != 0);
 		critical_enter();
 		vector_state_store(td1);
 		critical_exit();
@@ -186,6 +192,26 @@ cpu_copy_thread(struct thread *td, struct thread *td0)
 
 	bcopy(td0->td_frame, td->td_frame, sizeof(struct trapframe));
 	bcopy(td0->td_pcb, td->td_pcb, sizeof(struct pcb));
+
+	/*
+	 * The pcb copy above brought pcb_vsaved and PCB_VS_STARTED with it, so
+	 * the new thread would share the creating thread's vector save area
+	 * and both would free it on exit:
+	 *
+	 *   panic: Duplicate free of 0x... from zone ...(malloc-1024)
+	 *       vector_thread_dtor() thread_reap_domain() thread_wait()
+	 *
+	 * cpu_fork() avoids this by calling vector_copy_thread(); this path was
+	 * never given the equivalent. A new thread does not inherit register
+	 * contents anyway, so start it with no vector state: the first vector
+	 * instruction traps and allocates a fresh area (see trap.c). Clearing
+	 * the pointer as well as the flag matters -- vector_init() asserts
+	 * pcb_vsaved == NULL.
+	 */
+	td->td_pcb->pcb_vsaved = NULL;
+	td->td_pcb->pcb_vsflags &= ~PCB_VS_STARTED;
+	/* cpu_switch tests the trap-frame VS bits before restoring state. */
+	td->td_frame->tf_sstatus &= ~SSTATUS_VS_MASK;
 
 	td->td_pcb->pcb_s[0] = (uintptr_t)fork_return;
 	td->td_pcb->pcb_s[1] = (uintptr_t)td;

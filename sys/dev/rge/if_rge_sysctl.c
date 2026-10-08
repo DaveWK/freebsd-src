@@ -107,7 +107,7 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "recv_input_cnt",
 	    CTLFLAG_RD, &sc->sc_drv_stats.recv_input_cnt,
-	        "calls to if_input to process frames");
+	        "received frames delivered to the stack or LRO");
 
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_desc_err_multidesc",
 	    CTLFLAG_RD, &sc->sc_drv_stats.rx_desc_err_multidesc,
@@ -116,6 +116,11 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_watchdog_timeout_cnt",
 	    CTLFLAG_RD, &sc->sc_drv_stats.tx_watchdog_timeout_cnt,
 	        "TX watchdog timeouts");
+
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_lro_queued", CTLFLAG_RD,
+	    &sc->sc_drv_stats.rx_lro_queued, "RX packets accepted by software LRO");
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_lro_flushed", CTLFLAG_RD,
+	    &sc->sc_drv_stats.rx_lro_flushed, "Aggregated LRO packets delivered");
 
 	/* TX encap counters */
 
@@ -147,6 +152,18 @@ rge_sysctl_drv_stats_attach(struct rge_softc *sc)
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_offload_vlan_tag_set",
 	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_vlan_tag_set,
 	    "Number of frames TX'ed with VLAN offload tag set");
+
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_offload_tso_set",
+	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_tso_set,
+	    "Number of TSO frames handed to the hardware");
+
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "tx_offload_tso_err",
+	    CTLFLAG_RD, &sc->sc_drv_stats.tx_offload_tso_err,
+	    "Number of TSO frames dropped (headers not parseable)");
+
+	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_rss_hashed",
+	    CTLFLAG_RD, &sc->sc_drv_stats.rx_rss_hashed,
+	    "Number of RX frames delivered with a hardware RSS flow hash");
 
 	/* RX counters */
 	SYSCTL_ADD_QUAD(ctx, child, OID_AUTO, "rx_ether_csum_err",
@@ -222,6 +239,27 @@ rge_sysctl_mac_stats_attach(struct rge_softc *sc)
 	/* uint16_t rge_tx_undrn */
 }
 
+/* Diagnostic switch: retain the production deferred path by default. */
+static int
+rge_sysctl_tx_direct(SYSCTL_HANDLER_ARGS)
+{
+	struct rge_softc *sc = arg1;
+	int error, value;
+
+	RGE_LOCK(sc);
+	value = sc->sc_tx_direct;
+	RGE_UNLOCK(sc);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value != 0 && value != 1)
+		return (EINVAL);
+	RGE_LOCK(sc);
+	sc->sc_tx_direct = value;
+	RGE_UNLOCK(sc);
+	return (0);
+}
+
 void
 rge_sysctl_attach(struct rge_softc *sc)
 {
@@ -232,7 +270,67 @@ rge_sysctl_attach(struct rge_softc *sc)
 	    "debug", CTLFLAG_RW, &sc->sc_debug, 0,
 	    "control debugging printfs");
 
-	sc->sc_rx_process_limit = 16;
+	sc->sc_tx_direct = 0;
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "tx_direct", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, rge_sysctl_tx_direct, "I",
+	    "submit TX inline when no worker is pending (diagnostic)");
+
+	/*
+	 * Frames handled per interrupt.  With the simulated interrupt
+	 * moderation timer (~125 us) the batch bounds receive throughput:
+	 * 16 frames capped an MTU-1500 TCP receiver at ~1.46 Gb/s on the
+	 * 2.5 GbE RTL8125; 64 reaches line rate (2.35 Gb/s) with no other
+	 * change, and the ring (1024 entries) has ample room.
+	 */
+	sc->sc_rx_process_limit = 64;
+
+	/*
+	 * Hardware RSS hash in the Rx descriptor, delivered as the mbuf flowid
+	 * so netisr and LRO can steer flows; takes effect at the next init.
+	 */
+	sc->sc_rss_hash = 1;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "rss_hash", CTLFLAG_RW, &sc->sc_rss_hash, 0,
+	    "compute an RSS flow hash for received frames (applied on init)");
+
+	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "nqueues", CTLFLAG_RD, &sc->sc_nqueues, 0,
+	    "receive queues in use");
+	SYSCTL_ADD_BOOL(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "msix", CTLFLAG_RD, &sc->sc_msix, 0,
+	    "MSI-X with a vector per receive queue (v2 interrupt space)");
+	/*
+	 * Units of roughly 44 us on the RTL8125B: 3 ~ the legacy SIM timer's
+	 * 125 us cadence.  0 disables the timer (an interrupt per arrival).
+	 */
+	sc->sc_rx_miti = 3;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "rx_miti", CTLFLAG_RW, &sc->sc_rx_miti, 0,
+	    "MSI-X receive interrupt mitigation timer byte (applied on init)");
+	/* Realtek's timer_count_v2 (0x2600 / 0x100): ~1.7 ms, a 1024-entry ring absorbs it. */
+	sc->sc_tx_miti = 0x26;
+	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+	    "tx_miti", CTLFLAG_RW, &sc->sc_tx_miti, 0,
+	    "MSI-X transmit completion mitigation timer byte (applied on init)");
+	{
+		struct sysctl_oid *qtree;
+		char name[8];
+		unsigned int i;
+
+		for (i = 0; i < sc->sc_nqueues; i++) {
+			snprintf(name, sizeof(name), "rxq%u", i);
+			qtree = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(tree),
+			    OID_AUTO, name, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+			    "receive queue");
+			SYSCTL_ADD_QUAD(ctx, SYSCTL_CHILDREN(qtree), OID_AUTO,
+			    "frames", CTLFLAG_RD, &sc->sc_queues[i].q_rx_frames,
+			    "frames received on this queue");
+			SYSCTL_ADD_QUAD(ctx, SYSCTL_CHILDREN(qtree), OID_AUTO,
+			    "interrupts", CTLFLAG_RD, &sc->sc_queues[i].q_rx_intr,
+			    "interrupts taken for this queue");
+		}
+	}
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 	    "rx_process_limit", CTLFLAG_RW, &sc->sc_rx_process_limit, 0,
 	    "max number of RX packets to process per interrupt");

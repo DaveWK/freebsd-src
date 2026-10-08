@@ -206,6 +206,31 @@ nvme_completion_is_retry(const struct nvme_completion *cpl)
 	}
 }
 
+static bus_dmasync_op_t
+nvme_payload_sync_op(const struct nvme_qpair *qpair,
+    const struct nvme_request *req, bool before)
+{
+
+	/*
+	 * Ordinary I/O transfers data in one direction.  Synchronizing both
+	 * directions also copies bounced buffers both ways, wasting memory
+	 * bandwidth and CPU time.  Keep the conservative behavior for admin
+	 * and other I/O commands, whose payload semantics are not decoded here.
+	 */
+	if (qpair->id != 0) {
+		switch (req->cmd.opc) {
+		case NVME_OPC_READ:
+			return (before ? BUS_DMASYNC_PREREAD :
+			    BUS_DMASYNC_POSTREAD);
+		case NVME_OPC_WRITE:
+			return (before ? BUS_DMASYNC_PREWRITE :
+			    BUS_DMASYNC_POSTWRITE);
+		}
+	}
+	return (before ? BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE :
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+}
+
 static void
 nvme_qpair_complete_tracker(struct nvme_tracker *tr,
     struct nvme_completion *cpl, error_print_t print_on_error)
@@ -239,7 +264,7 @@ nvme_qpair_complete_tracker(struct nvme_tracker *tr,
 		if (req->payload_valid) {
 			bus_dmamap_sync(qpair->dma_tag_payload,
 			    tr->payload_dma_map,
-			    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+			    nvme_payload_sync_op(qpair, req, false));
 		}
 		if (req->cb_fn)
 			req->cb_fn(req->cb_arg, cpl);
@@ -549,13 +574,20 @@ nvme_qpair_construct(struct nvme_qpair *qpair,
 	qpair->timer_armed = false;
 	qpair->recovery_state = RECOVERY_WAITING;
 
-	/* Note: NVMe PRP format is restricted to 4-byte alignment. */
+	/*
+	 * NVMe PRPs require 4-byte alignment and encode the first segment's
+	 * length through its offset within a controller page.  Preserve that
+	 * offset when busdma bounces a partial page; otherwise the controller
+	 * consumes bytes beyond that segment instead of advancing to PRP2.
+	 * A load may wait for bounce pages; busdma then calls nvme_payload_map
+	 * later with the qpair lock held, as when it is called directly.
+	 */
 	err = bus_dma_tag_create(bus_get_dma_tag(ctrlr->dev),
 	    4, ctrlr->page_size, BUS_SPACE_MAXADDR,
 	    BUS_SPACE_MAXADDR, NULL, NULL, ctrlr->max_xfer_size,
 	    howmany(ctrlr->max_xfer_size, ctrlr->page_size) + 1,
-	    ctrlr->page_size, 0,
-	    NULL, NULL, &qpair->dma_tag_payload);
+	    ctrlr->page_size, BUS_DMA_KEEP_PG_OFFSET,
+	    busdma_lock_mutex, &qpair->lock, &qpair->dma_tag_payload);
 	if (err != 0) {
 		nvme_printf(ctrlr, "payload tag create failed %d\n", err);
 		goto out;
@@ -1117,7 +1149,7 @@ nvme_payload_map(void *arg, bus_dma_segment_t *seg, int nseg, int error)
 	}
 
 	bus_dmamap_sync(tr->qpair->dma_tag_payload, tr->payload_dma_map,
-	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+	    nvme_payload_sync_op(qpair, tr->req, true));
 	nvme_qpair_submit_tracker(tr->qpair, tr);
 }
 
@@ -1181,8 +1213,7 @@ _nvme_qpair_submit_request(struct nvme_qpair *qpair, struct nvme_request *req)
 	 * when there's no map to load).
 	 */
 	(void)bus_dmamap_load_mem(tr->qpair->dma_tag_payload,
-	    tr->payload_dma_map, &req->payload, nvme_payload_map, tr,
-	    BUS_DMA_NOWAIT);
+	    tr->payload_dma_map, &req->payload, nvme_payload_map, tr, 0);
 }
 
 void

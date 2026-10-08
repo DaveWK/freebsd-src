@@ -1185,7 +1185,8 @@ relock:
 	memcpy(fip->de_Name, toname, 11);	/* update denode */
 	error = msdosfs_lookup_ino(tdvp, NULL, tcnp, &scn, &blkoff);
 	if (error == EJUSTRETURN) {
-		tdip->de_fndoffset = to_diroffset;
+		/* Keep the slot selected for the new long filename entries. */
+		to_diroffset = tdip->de_fndoffset;
 		error = createde(fip, tdip, NULL, tcnp);
 	}
 	if (error != 0) {

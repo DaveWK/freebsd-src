@@ -192,6 +192,19 @@ exec_setregs(struct thread *td, struct image_params *imgp, uintptr_t stack)
 	tf->tf_sepc = imgp->entry_addr;
 
 	pcb->pcb_fpflags &= ~PCB_FP_STARTED;
+
+	/*
+	 * cpu_fork() handed this thread its parent's vector save area and
+	 * PCB_VS_STARTED, while the trap frame cleared above runs the new
+	 * image with VS off.  Its first vector instruction then traps, and
+	 * trap.c only enables VS for a thread it has not started -- every
+	 * other illegal instruction is SIGILL.  So with an RVV-built world,
+	 * init could run but each child it forked and exec'd died on its
+	 * first vector instruction (sh: "exited on signal 4").  Start the new
+	 * image with no vector state, exactly as the FP state above.
+	 */
+	if ((pcb->pcb_vsflags & PCB_VS_STARTED) != 0)
+		vector_state_free(td);
 }
 
 /* Sanity check these are the same size, they will be memcpy'd to and from */
@@ -292,10 +305,14 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 	 *
 	 * Ignore writes to the FS field as set_fpcontext() will set
 	 * it explicitly.
+	 *
+	 * Ignore writes to the VS field: the vector register state, if any, is
+	 * restored from the register-context list below, and the VS field is
+	 * set there and after set_fpcontext(), the same way FS is.
 	 */
 	if (((mcp->mc_gpregs.gp_sstatus ^ tf->tf_sstatus) &
-	    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_UPIE |
-	    SSTATUS_UIE)) != 0)
+	    ~(SSTATUS_SD | SSTATUS_XS_MASK | SSTATUS_FS_MASK | SSTATUS_VS_MASK |
+	    SSTATUS_UPIE | SSTATUS_UIE)) != 0)
 		return (EINVAL);
 
 	memcpy(tf->tf_t, mcp->mc_gpregs.gp_t, sizeof(tf->tf_t));
@@ -309,6 +326,17 @@ set_mcontext(struct thread *td, mcontext_t *mcp)
 	tf->tf_sstatus = mcp->mc_gpregs.gp_sstatus;
 
 	set_fpcontext(td, mcp);
+
+	/*
+	 * Start from a defined vector status the same way set_fpcontext() does
+	 * for FS.  It stays off even when the RISCV_CTX_MAGIC_VS arm below
+	 * restores the vector registers: they go into the save area, not the
+	 * hardware, and the first vector instruction after the return traps
+	 * so that trap.c reloads them (a clean status here would let the
+	 * interrupted code run on with the handler's registers).
+	 */
+	tf->tf_sstatus &= ~SSTATUS_VS_MASK;
+	tf->tf_sstatus |= SSTATUS_VS_OFF;
 
 	if (mcp->mc_ptr == 0)
 		return (0);
@@ -456,6 +484,20 @@ sendsig_ctx_vector(struct thread *td, vm_offset_t *addrp)
 		return (true);
 
 	MPASS(pcb->pcb_vsaved != NULL);
+
+	/*
+	 * The save area is only current while the status is clean (or off,
+	 * after a sigreturn left the registers there).  Dirty means the
+	 * live registers are newer, so store them first, as get_fpcontext()
+	 * does with fpe_state_save().
+	 */
+	if ((td->td_frame->tf_sstatus & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY) {
+		critical_enter();
+		vector_state_store(td);
+		td->td_frame->tf_sstatus &= ~SSTATUS_VS_MASK;
+		td->td_frame->tf_sstatus |= SSTATUS_VS_CLEAN;
+		critical_exit();
+	}
 
 	buf_size = vector_get_size();
 	ctx_size = CTX_SIZE_VS(buf_size);

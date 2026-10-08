@@ -1178,16 +1178,20 @@
 			usb_dwc3: usb@c0a00000 {
 				compatible = "spacemit,k1-dwc3";
 				reg = <0x0 0xc0a00000 0x0 0x10000>;
-				clocks = <&syscon_apmu CLK_USB30>;
-				clock-names = "usbdrd30";
+				clocks = <&syscon_apmu CLK_USB30>,
+					 <&syscon_apmu CLK_USB_AXI>,
+					 <&syscon_apmu CLK_USB_P1>;
+				clock-names = "usbdrd30", "usb-axi", "usb-p1";
 				interrupts = <125>;
 				phys = <&usbphy2>, <&combo_phy PHY_TYPE_USB3>;
 				phy-names = "usb2-phy", "usb3-phy";
 				phy_type = "utmi";
 				resets = <&syscon_apmu RESET_USB30_AHB>,
 					 <&syscon_apmu RESET_USB30_VCC>,
-					 <&syscon_apmu RESET_USB30_PHY>;
-				reset-names = "ahb", "vcc", "phy";
+					 <&syscon_apmu RESET_USB30_PHY>,
+					 <&syscon_apmu RESET_USB_AXI>,
+					 <&syscon_apmu RESET_USBP1_AXI>;
+				reset-names = "ahb", "vcc", "phy", "axi", "p1-axi";
 				reset-delay = <2>;
 				snps,hsphy_interface = "utmi";
 				snps,dis_enblslpm_quirk;
@@ -1196,6 +1200,20 @@
 				snps,dis_u2_susphy_quirk;
 				snps,dis_u3_susphy_quirk;
 				snps,dis_rxdet_inp3_quirk;
+				snps,dis-tx-ipgap-linecheck-quirk;
+				status = "disabled";
+			};
+
+			sdhci0: mmc@d4280000 {
+				compatible = "spacemit,k1-sdhci";
+				reg = <0x0 0xd4280000 0x0 0x200>;
+				clocks = <&syscon_apmu CLK_SDH_AXI>,
+					 <&syscon_apmu CLK_SDH0>;
+				clock-names = "core", "io";
+				resets = <&syscon_apmu RESET_SDH_AXI>,
+					 <&syscon_apmu RESET_SDH0>;
+				reset-names = "axi", "sdh";
+				interrupts = <99>;
 				status = "disabled";
 			};
 

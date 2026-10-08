@@ -445,15 +445,27 @@ do_trap_user(struct trapframe *frame)
 			pcb->pcb_fpflags |= PCB_FP_STARTED;
 			break;
 		}
-		if (has_vector && (pcb->pcb_vsflags & PCB_VS_STARTED) == 0) {
+		if (has_vector &&
+		    (frame->tf_sstatus & SSTATUS_VS_MASK) == SSTATUS_VS_OFF) {
 			/*
 			 * Could be a vector trap. Enable VS usage
 			 * for this thread and try again.
+			 *
+			 * A thread that already has a save area is here
+			 * because sigreturn left its restored registers in
+			 * the area with the status off (exec_machdep.c);
+			 * reload them before the retry.
 			 */
-			vector_state_init(td);
+			if ((pcb->pcb_vsflags & PCB_VS_STARTED) == 0) {
+				vector_state_init(td);
+				pcb->pcb_vsflags |= PCB_VS_STARTED;
+			}
+			/* Load the fresh or restored context before enabling user VS. */
+			critical_enter();
+			vector_state_restore(td);
 			frame->tf_sstatus &= ~SSTATUS_VS_MASK;
 			frame->tf_sstatus |= SSTATUS_VS_CLEAN;
-			pcb->pcb_vsflags |= PCB_VS_STARTED;
+			critical_exit();
 			break;
 		}
 		call_trapsignal(td, SIGILL, ILL_ILLTRP, (void *)frame->tf_sepc,

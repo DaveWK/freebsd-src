@@ -237,6 +237,17 @@ SYSCTL_INT(_vm_pmap, OID_AUTO, mode, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
     &pmap_mode, 0,
     "translation mode, 0 = SV39, 1 = SV48");
 
+/*
+ * Boot-time control for the Svinval TLB invalidation path.  When the CPU
+ * advertises Svinval the kernel invalidates remote TLBs with a rendezvous
+ * of sinval.vma; setting vm.pmap.svinval=0 in the loader keeps the SBI
+ * remote-fence path instead.  Read before ifunc resolution, so NOFETCH.
+ */
+static int pmap_svinval_enabled = 1;
+SYSCTL_INT(_vm_pmap, OID_AUTO, svinval, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
+    &pmap_svinval_enabled, 0,
+    "use Svinval rendezvous for TLB invalidation (0 = SBI remote fence)");
+
 struct pmap kernel_pmap_store;
 
 vm_offset_t virtual_avail;	/* VA of first avail page (after kernel bss) */
@@ -991,6 +1002,9 @@ pmap_bootstrap(vm_paddr_t kernstart, vm_size_t kernlen)
 		pmap_store(&pte[i], L3_PTE(pa + ptoa(i), PTE_KERN |
 		    pmap_memattr_bits(VM_MEMATTR_DEFAULT)));
 
+	/* Publish the new mappings before the first access. */
+	sfence_vma();
+
 	/* Now, it can be initialized. */
 	dpcpu_init((void *)dpcpu, 0);
 
@@ -1004,6 +1018,9 @@ pmap_bootstrap(vm_paddr_t kernstart, vm_size_t kernlen)
 	for (i = 0; i < howmany(msgbufsize, PAGE_SIZE); i++)
 		pmap_store(&pte[i], L3_PTE(pa + ptoa(i), PTE_KERN |
 		    pmap_memattr_bits(VM_MEMATTR_DEFAULT)));
+
+	/* Discard cached invalid translations before msgbufinit(). */
+	sfence_vma();
 
 #undef	reserve_space
 
@@ -1136,6 +1153,7 @@ static void
 pmap_invalidate_range_svinval(pmap_t pmap, vm_offset_t sva, vm_offset_t eva)
 {
 	struct svinval_args args;
+	cpuset_t mask;
 
 	if (CPU_EMPTY(&pmap->pm_active))
 		return;
@@ -1149,11 +1167,18 @@ pmap_invalidate_range_svinval(pmap_t pmap, vm_offset_t sva, vm_offset_t eva)
 	args.sva = sva;
 	args.eva = eva;
 	fence();
-	if (smp_started)
-		smp_rendezvous_cpus(pmap->pm_active, smp_no_rendezvous_barrier,
-		    pmap_invalidate_range_svinval_cb,
-		    smp_no_rendezvous_barrier, &args);
-	else
+	if (smp_started) {
+		/*
+		 * The last active CPU may switch away after the early check.
+		 * Validate the same snapshot passed to the rendezvous, which
+		 * requires at least one target CPU.
+		 */
+		mask = pmap->pm_active;
+		if (!CPU_EMPTY(&mask))
+			smp_rendezvous_cpus(mask, smp_no_rendezvous_barrier,
+			    pmap_invalidate_range_svinval_cb,
+			    smp_no_rendezvous_barrier, &args);
+	} else
 		pmap_invalidate_range_svinval_cb(&args);
 	sched_unpin();
 }
@@ -1164,10 +1189,18 @@ pmap_invalidate_page_svinval(pmap_t pmap, vm_offset_t va)
 	pmap_invalidate_range_svinval(pmap, va, va + PAGE_SIZE);
 }
 
+static bool
+pmap_use_svinval(void)
+{
+
+	TUNABLE_INT_FETCH("vm.pmap.svinval", &pmap_svinval_enabled);
+	return (has_svinval && pmap_svinval_enabled != 0);
+}
+
 DEFINE_IFUNC(, void, pmap_invalidate_range,
     (pmap_t pmap, vm_offset_t sva, vm_offset_t eva))
 {
-	if (has_svinval)
+	if (pmap_use_svinval())
 		return (pmap_invalidate_range_svinval);
 	return (pmap_invalidate_range_sbi);
 }
@@ -1175,7 +1208,7 @@ DEFINE_IFUNC(, void, pmap_invalidate_range,
 DEFINE_IFUNC(, void, pmap_invalidate_page,
     (pmap_t pmap, vm_offset_t va))
 {
-	if (has_svinval)
+	if (pmap_use_svinval())
 		return (pmap_invalidate_page_svinval);
 	return (pmap_invalidate_page_sbi);
 }
@@ -3001,28 +3034,15 @@ pmap_fault(pmap_t pmap, vm_offset_t va, vm_prot_t ftype)
 
 	KASSERT(VIRT_IS_VALID(va), ("pmap_fault: invalid va %#lx", va));
 
-	if (pmap == kernel_pmap) {
-		/*
-		 * Locking the kernel pmap while processing spurious faults
-		 * may lead to a panic since we might be running a critical section
-		 * or already holding the kernel pmap lock.
-		 * We deal with this by taking advantage of the fact that
-		 * kernel PTPs are never freed and performing a lockless lookup
-		 * to determine whether a valid mapping exits.
-		 */
-		pte = pmap_fault_lookup(pmap, va);
-		if (pte != NULL && (pmap_load(pte) & PTE_KERN) == PTE_KERN) {
-			sfence_vma_page(va);
-			return (1);
-		}
-		/*
-		 * The entry is either not present or missing some bits.
-		 * Fall back to the locked lookup below to handle the fault.
-		 */
-	}
-
+	/*
+	 * Kernel page tables are never freed. Handle both spurious TLB
+	 * faults and software A/D updates without a sleepable lock: faults
+	 * can occur during bootstrap, in critical sections, or while the
+	 * kernel pmap lock is already held. Preserve permission checks.
+	 */
 	rv = 0;
-	PMAP_LOCK(pmap);
+	if (pmap != kernel_pmap)
+		PMAP_LOCK(pmap);
 	pte = pmap_fault_lookup(pmap, va);
 	if (pte == NULL || ((oldpte = pmap_load(pte)) & PTE_V) == 0)
 		goto done;
@@ -3047,7 +3067,8 @@ pmap_fault(pmap_t pmap, vm_offset_t va, vm_prot_t ftype)
 	sfence_vma();
 	rv = 1;
 done:
-	PMAP_UNLOCK(pmap);
+	if (pmap != kernel_pmap)
+		PMAP_UNLOCK(pmap);
 	return (rv);
 }
 

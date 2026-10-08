@@ -62,8 +62,10 @@ struct rge_drv_stats {
 	/* How many times tx_task was run */
 	uint64_t		tx_task_cnt;
 
-	/* Count of frames passed up into if_input() */
+	/* Count of received frames delivered to the stack or LRO. */
 	uint64_t		recv_input_cnt;
+	uint64_t		rx_lro_queued;
+	uint64_t		rx_lro_flushed;
 
 	/*
 	 * For now - driver doesn't support multi descriptor
@@ -83,6 +85,9 @@ struct rge_drv_stats {
 	uint64_t		tx_offload_tcp_csum_set;
 	uint64_t		tx_offload_udp_csum_set;
 	uint64_t		tx_offload_vlan_tag_set;
+	uint64_t		tx_offload_tso_set;
+	uint64_t		tx_offload_tso_err;
+	uint64_t		rx_rss_hashed;
 
 	uint64_t		rx_ether_csum_err;
 	uint64_t		rx_desc_jumbo_frag;
@@ -131,6 +136,8 @@ struct rge_rx {
 	struct mbuf		**rge_tail;
 };
 
+struct lro_ctrl;
+
 struct rge_queues {
 	struct rge_softc	*q_sc;
 	void			*q_ihc;
@@ -138,6 +145,27 @@ struct rge_queues {
 	char			q_name[16];
 	struct rge_tx		q_tx;
 	struct rge_rx		q_rx;
+	/* Receive ring state is protected by q_rx_mtx (sc_mtx -> q_rx_mtx). */
+	struct mtx		q_rx_mtx;
+	struct lro_ctrl		*q_lro;
+	uint64_t		q_rx_frames;
+	uint64_t		q_rx_intr;
+	/*
+	 * Transmit ring state is protected by q_tx_mtx, a leaf lock taken
+	 * without sc_mtx on the fast path so that forwarding threads landing
+	 * on different TX queues do not serialise (one TX queue was the
+	 * router-aggregate ceiling).  init/stop quiesce TX by taking every
+	 * q_tx_mtx under sc_mtx.
+	 */
+	struct mtx		q_tx_mtx;
+	char			q_tx_name[16];
+	struct mbufq		q_txq;
+	struct task		q_tx_task;
+	bool			q_tx_task_pending;	/* q_tx_mtx */
+	bool			q_tx_active;		/* has a TX ring + hw queue */
+	bus_dmamap_t		*q_tx_spare;		/* per-CPU spare maps (mp_ncpus) */
+	uint64_t		q_tx_frames;
+	uint64_t		q_tx_intr;
 };
 
 struct rge_mac_stats {
@@ -155,10 +183,15 @@ struct rge_softc {
 	if_t			sc_ifp;		/* Ethernet common data */
 	bool			sc_ether_attached;
 	struct mtx		sc_mtx;
-	struct resource		*sc_irq[RGE_MSI_MESSAGES];
-	void			*sc_ih[RGE_MSI_MESSAGES];
+	struct resource		*sc_irq[RGE_MSIX_MESSAGES];
+	void			*sc_ih[RGE_MSIX_MESSAGES];
+	bool			sc_msix;	/* v2 interrupt space, per-queue vectors */
+	int			sc_rx_miti;	/* v2 receive mitigation timer byte */
+	int			sc_tx_miti;	/* v2 transmit completion timer byte */
 	uint32_t		sc_expcap;	/* PCe exp cap */
 	struct resource		*sc_bres;	/* bus space MMIO/IOPORT resource */
+	struct resource		*sc_msix_res;	/* BAR holding the MSI-X table */
+	int			sc_msix_rid;
 	bus_space_handle_t	rge_bhandle;	/* bus space handle */
 	bus_space_tag_t		rge_btag;	/* bus space tag */
 	bus_size_t		rge_bsize;
@@ -173,18 +206,18 @@ struct rge_softc {
 	enum rge_mac_type	rge_type;
 
 	struct rge_queues	*sc_queues;
-	unsigned int		sc_nqueues;
+	unsigned int		sc_nqueues;	/* receive queues (RSS) */
+	unsigned int		sc_ntxq;	/* transmit queues (1 or 2) */
 
 	bool			sc_detaching;
 	bool			sc_stopped;
 	bool			sc_suspended;
 
-	/* Note: these likely should be per-TXQ */
-	struct mbufq		sc_txq;
+	/* Shared taskqueue for the per-TXQ drain tasks (q_tx_task). */
 	struct taskqueue *	sc_tq;
 	char			sc_tq_name[32];
 	char			sc_tq_thr_name[32];
-	struct task		sc_tx_task;
+	int			sc_tx_direct;	/* read-mostly; drain in caller ctx */
 
 	struct callout		sc_timeout;	/* 1 second tick */
 
@@ -205,6 +238,7 @@ struct rge_softc {
 	uint32_t		sc_debug;
 
 	int			sc_rx_process_limit;
+	int			sc_rss_hash;
 	int			sc_disable_aspm;
 
 	struct rge_drv_stats	sc_drv_stats;

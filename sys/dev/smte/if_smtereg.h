@@ -1,0 +1,148 @@
+/*-
+ * SPDX-License-Identifier: ISC
+ *
+ * Register definitions for the SpacemiT K1 Ethernet MAC.
+ * From OpenBSD's if_smte.c:
+ * Copyright (c) 2026 Mark Kettenis <kettenis@openbsd.org>
+ */
+
+#ifndef _IF_SMTEREG_H_
+#define	_IF_SMTEREG_H_
+
+/* DMA/MAC registers */
+#define	DMA_CONFIG				0x0000
+#define	 DMA_CONFIG_DMA_64BIT_MODE		(1U << 18)
+#define	 DMA_CONFIG_STRICT_BURST		(1U << 17)
+#define	 DMA_CONFIG_BURST_LENGTH_MASK		(0x7f << 1)
+#define	 DMA_CONFIG_BURST_LENGTH_16		(0x10 << 1)
+#define	 DMA_CONFIG_SOFTWARE_RESET		(1U << 0)
+#define	DMA_CTRL				0x0004
+#define	 DMA_CTRL_START_STOP_RX_DMA		(1U << 1)
+#define	 DMA_CTRL_START_STOP_TX_DMA		(1U << 0)
+#define	DMA_STATUS_IRQ				0x0008
+#define	 DMA_STATUS_IRQ_RX_MISSED_FRAME		(1U << 7)
+#define	 DMA_STATUS_IRQ_RX_DMA_STOPPED		(1U << 6)
+#define	 DMA_STATUS_IRQ_RX_DES_UNAVAILABLE	(1U << 5)
+#define	 DMA_STATUS_IRQ_RX_TRANSFER_DONE	(1U << 4)
+#define	 DMA_STATUS_IRQ_TX_DMA_STOPPED		(1U << 2)
+#define	 DMA_STATUS_IRQ_TX_DES_UNAVAILABLE	(1U << 1)
+#define	 DMA_STATUS_IRQ_TX_TRANSFER_DONE	(1U << 0)
+#define	DMA_INTR_ENABLE				0x000c
+#define	 DMA_INTR_ENABLE_RX_MISSED_FRAME	(1U << 7)
+#define	 DMA_INTR_ENABLE_RX_DMA_STOPPED		(1U << 6)
+#define	 DMA_INTR_ENABLE_RX_DES_UNAVAILABLE	(1U << 5)
+#define	 DMA_INTR_ENABLE_RX_TRANSFER_DONE	(1U << 4)
+#define	 DMA_INTR_ENABLE_TX_DMA_STOPPED		(1U << 2)
+#define	 DMA_INTR_ENABLE_TX_DES_UNAVAILABLE	(1U << 1)
+#define	 DMA_INTR_ENABLE_TX_TRANSFER_DONE	(1U << 0)
+#define	DMA_TRANSMIT_AUTO_POLL_COUNTER		0x0010
+#define	DMA_TRANSMIT_POLL_DEMAND		0x0014
+#define	DMA_RECEIVE_POLL_DEMAND			0x0018
+#define	DMA_TRANSMIT_BASE_ADDRESS		0x001c
+#define	DMA_RECEIVE_BASE_ADDRESS		0x0020
+#define	DMA_RECEIVE_IRQ_MITIGATION		0x002c
+#define	 DMA_RECEIVE_IRQ_MITIGATION_FRAME_COUNTER_SHIFT 0
+#define	 DMA_RECEIVE_IRQ_MITIGATION_TIMEOUT_COUNTER_SHIFT 8
+#define	 DMA_RECEIVE_IRQ_MITIGATION_MITIGATION_ENABLE (1U << 31)
+#define	MAC_GLOBAL_CTRL				0x0100
+#define	 MAC_GLOBAL_CTRL_DUPLEX_MODE		(1U << 2)
+#define	 MAC_GLOBAL_CTRL_SPEED_MASK		(0x3 << 0)
+#define	 MAC_GLOBAL_CTRL_SPEED_10		(0x0 << 0)
+#define	 MAC_GLOBAL_CTRL_SPEED_100		(0x1 << 0)
+#define	 MAC_GLOBAL_CTRL_SPEED_1000		(0x2 << 0)
+#define	MAC_TRANSMIT_CTRL			0x0104
+#define	 MAC_TRANSMIT_CTRL_IFG_LEN_MASK		(0x7 << 4)
+#define	 MAC_TRANSMIT_CTRL_TX_AUTO_RETRY	(1U << 3)
+#define	 MAC_TRANSMIT_CTRL_TX_ENABLE		(1U << 0)
+#define	MAC_RECEIVE_CTRL			0x0108
+#define	 MAC_RECEIVE_CTRL_STORE_FORWARD		(1U << 3)
+#define	 MAC_RECEIVE_CTRL_RX_ENABLE		(1U << 0)
+#define	MAC_MAXIMUM_FRAME_SIZE			0x010c
+#define	MAC_TRANSMIT_JABBER_SIZE		0x0110
+#define	MAC_RECEIVE_JABBER_SIZE			0x0114
+#define	MAC_ADDR_CTRL				0x0118
+#define	 MAC_ADDR_CTRL_PROMISCUOUS_MODE		(1U << 8)
+#define	 MAC_ADDR_CTRL_MAC_ADDR1_ENABLE		(1U << 0)
+#define	MAC_ADDR1_HI				0x0120
+#define	MAC_ADDR1_ME				0x0124
+#define	MAC_ADDR1_LO				0x0128
+#define	MAC_MULTICAST_HASH_TABLE1		0x0150
+#define	MAC_MULTICAST_HASH_TABLE2		0x0154
+#define	MAC_MULTICAST_HASH_TABLE3		0x0158
+#define	MAC_MULTICAST_HASH_TABLE4		0x015c
+#define	MAC_MDIO_CTRL				0x01a0
+#define	 MAC_MDIO_CTRL_START_MDIO_TRANS		(1U << 15)
+#define	 MAC_MDIO_CTRL_MDIO_READ_WRITE		(1U << 10)
+#define	 MAC_MDIO_CTRL_REGISTER_ADDRESS_SHIFT	5
+#define	 MAC_MDIO_CTRL_PHY_ADDRESS_SHIFT	0
+#define	MAC_MDIO_DATA				0x01a4
+#define	MAC_TRANSMIT_FIFO_ALMOST_FULL		0x01c0
+#define	MAC_TRANSMIT_PACKET_START_THRESHOLD	0x01c4
+#define	MAC_RECEIVE_PACKET_START_THRESHOLD	0x01c8
+#define	MAC_INTR_ENABLE				0x01e4
+
+/* APMU registers, relative to the "spacemit,apmu" property offset. */
+#define	APMU_EMAC_CLK_RST_CTRL			0x0000
+#define	 APMU_EMAC_AXI_MST_ID			(1U << 13)
+#define	 APMU_EMAC_PHY_INTR_EN			(1U << 12)
+#define	 APMU_EMAC_RGMII_TXC_SRC_SEL		(1U << 8)  /* RGMII: 0=TX clk from RX clk, 1=from SoC */
+#define	 APMU_EMAC_REF_CLK_SEL			(1U << 3)  /* RMII only: 0=ref clk from PHY, 1=from SoC */
+#define	 APMU_EMAC_PHY_SEL_RGMII		(1U << 2)  /* 0=RMII, 1=RGMII */
+#define	APMU_EMAC_RGMII_DLINE			0x0004
+#define	 APMU_EMAC_RGMII_DLINE_TX_DELAY_MASK	(0xff << 24)
+#define	 APMU_EMAC_RGMII_DLINE_TX_DELAY_SHIFT	24
+#define	 APMU_EMAC_RGMII_DLINE_TX_STEP_MASK	(0x3 << 20)
+#define	 APMU_EMAC_RGMII_DLINE_TX_STEP_15P6	(0x0 << 20)
+#define	 APMU_EMAC_RGMII_DLINE_TX_EN		(1U << 16)
+#define	 APMU_EMAC_RGMII_DLINE_RX_DELAY_MASK	(0xff << 8)
+#define	 APMU_EMAC_RGMII_DLINE_RX_DELAY_SHIFT	8
+#define	 APMU_EMAC_RGMII_DLINE_RX_STEP_MASK	(0x3 << 4)
+#define	 APMU_EMAC_RGMII_DLINE_RX_STEP_15P6	(0x0 << 4)
+#define	 APMU_EMAC_RGMII_DLINE_RX_EN		(1U << 0)
+
+/* DMA descriptors. */
+struct smte_desc {
+	uint32_t sd_desc0;
+	uint32_t sd_desc1;
+	uint32_t sd_addr1;
+	uint32_t sd_addr2;
+};
+
+/* Rx bits */
+#define	RX_DESC0_FRAME_PACKET_LENGTH_MASK	(0x3fff << 0)
+#define	RX_DESC0_FRAME_PACKET_LENGTH_SHIFT	0
+#define	RX_DESC0_FRAME_RUNT			(1U << 15)
+#define	RX_DESC0_FRAME_CRC_ERR			(1U << 20)
+#define	RX_DESC0_FRAME_MAX_LEN_ERR		(1U << 21)
+#define	RX_DESC0_FRAME_JABBER_ERR		(1U << 22)
+#define	RX_DESC0_FRAME_LENGTH_ERR		(1U << 23)
+#define	RX_DESC0_OWN				(1U << 31)
+#define	RX_DESC1_SIZE1_MASK			(0xfff << 0)
+#define	RX_DESC1_END_RING			(1U << 26)
+
+/* Tx bits */
+#define	TX_DESC0_OWN				(1U << 31)
+/*
+ * Tx descriptor control bits, taken from the vendor U-Boot K1 EMAC driver
+ * (EMAC_DESC_FD / _LD / _EOR / _BUFF_SIZE1).  FIRST is bit 30 and LAST is
+ * bit 29 -- the reverse of the Synopsys layout this block otherwise
+ * resembles, and they were transposed here.  Bit 31 of des1 is not a
+ * control bit at all: the vendor driver never writes it.
+ */
+#define	TX_DESC1_SIZE1_MASK			(0xfff << 0)
+/*
+ * Bit layout per the Linux driver (k1_emac.h): FIRST is bit 29, LAST is
+ * bit 30 and INTERRUPT_ON_COMPLETION is bit 31.  (The *receive* descriptor
+ * has FIRST at 30 and LAST at 29 -- do not copy that here.)
+ */
+#define	TX_DESC1_SIZE2_MASK			(0xfff << 12)
+#define	TX_DESC1_FORCE_EOP_ERROR		(1U << 24)
+#define	TX_DESC1_SECOND_ADDRESS_CHAINED		(1U << 25)
+#define	TX_DESC1_END_RING			(1U << 26)
+#define	TX_DESC1_DISABLE_PADDING		(1U << 27)
+#define	TX_DESC1_ADD_CRC_DISABLE		(1U << 28)
+#define	TX_DESC1_FIRST_SEGMENT			(1U << 29)
+#define	TX_DESC1_LAST_SEGMENT			(1U << 30)
+#define	TX_DESC1_INTERRUPT_ON_COMPLETION	(1U << 31)
+
+#endif /* _IF_SMTEREG_H_ */
